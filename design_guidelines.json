@@ -1,0 +1,90 @@
+{
+  "project": {
+    "name": "FreePress",
+    "context": "hybrid_fullstack_mobile_app",
+    "theme": "light-first with dark reading mode",
+    "audience": ["independent reporters", "news readers/supporters", "moderators/admins"],
+    "emotional_goal": "courageous, human, accountable journalism without editorial gatekeeping",
+    "success_actions": ["read a report", "follow a reporter", "support a reporter for ₹7", "start a live stream", "resolve a moderation problem"]
+  },
+  "design_decisions": {
+    "fusion": ["broadsheet editorial typography", "field-notebook annotation marks", "utility-console status language"],
+    "visual_story": "The feed should feel like a dispatch wall: a strong lead story, then evidence-rich reports, then a human reporter profile and a clear support moment.",
+    "pattern_breaks": ["Use an offset editorial lead card rather than centered hero content to create urgency", "Use red only for live/safety states, never as decoration", "Keep moderation cardless and table-like while reader surfaces feel tactile"]
+  },
+  "typography": {
+    "heading_font": "Bodoni Moda",
+    "body_font": "IBM Plex Sans",
+    "utility_font": "IBM Plex Mono",
+    "rules": ["Do not use Inter, Roboto, Open Sans, Lato, or Space Grotesk for headings", "H1 max 36px mobile / 48px large, tight tracking and leading-none", "H2 28px, H3 22px, body 16px with 1.55 line-height", "Overlines uppercase, 11px, tracking-[0.2em]", "Use italic serif only for quotes or reporter bylines, not for controls"]
+  },
+  "colors": {
+    "archetype": "SWISS_AND_HIGH_CONTRAST with warm paper tint",
+    "paper": "#F4F0E8",
+    "surface": "#FFFDF8",
+    "ink": "#18202A",
+    "muted_ink": "#59616A",
+    "line": "#D7D1C6",
+    "signal_red": "#B42318",
+    "signal_red_dark": "#8F1D16",
+    "live_amber": "#B86B00",
+    "verified_blue": "#155E9A",
+    "success_green": "#2F6B4F",
+    "dark_reader": "#20252B",
+    "dark_surface": "#2A3037",
+    "dark_text": "#F7F3EA",
+    "rules": ["Never use pure black or pure gray", "Use red only for LIVE, urgent, destructive, or reporter safety states", "All text/background pairs must meet WCAG AA; large labels minimum 3:1, body minimum 4.5:1", "No full-screen gradients; use paper texture and thin rules instead"]
+  },
+  "component_name": {
+    "reader": ["AppHeader", "LeadDispatch", "NewsFeedItem", "TopicRail", "ReporterProfileSheet", "SupportReporterModal", "MediaPost", "LiveBadge", "PersistentAudioVideoBar"],
+    "reporter": ["ReporterHeader", "StoryComposer", "MediaSourcePicker", "CameraPreview", "MicCameraControlTray", "StreamSetupSheet", "StreamHealthPanel", "PostStatusBanner"],
+    "admin": ["AdminHeader", "MetricStrip", "ModerationQueue", "ReportDetailPanel", "UserManagementTable", "AuditLog", "ProblemResolutionDialog"],
+    "shared": ["RoleGate", "BottomTabBar", "FilterChips", "EmptyState", "LoadingSkeleton", "ToastMessage"]
+  },
+  "component_path": {
+    "existing_root": "/app/frontend/app",
+    "recommended_js_paths": ["/app/frontend/app/index.js", "/app/frontend/app/(reader)/index.js", "/app/frontend/app/(reporter)/studio.js", "/app/frontend/app/(admin)/queue.js", "/app/frontend/src/components/"],
+    "note": "This project uses Expo/React Native conventions. Write implementation guidance for .js files; do not assume .tsx, Tailwind web CSS, or HTML input/select elements.",
+    "ui_strategy": "Use React Native primitives plus accessible Pressable, Modal, FlatList, SectionList, TextInput, Switch and ActionSheet-like bottom sheets. If shadcn-compatible primitives are introduced for web, customize them and keep role-specific logic separate."
+  },
+  "grids": {
+    "reader": "Mobile-first single-column feed with 16px side gutters; lead story spans full width, evidence/media modules alternate inset widths.",
+    "reporter": "Single-column composer; media preview full bleed within padded frame; controls grouped in a bottom tray.",
+    "admin": "High-density responsive web fallback: 4-column metric strip, 3-column queue/detail/audit layout; mobile collapses to one column.",
+    "rules": ["Do not use equal bento squares", "Use generous 24-32px vertical spacing in reader surfaces", "Admin uses tighter 12-16px gaps and hard 1px rules", "Every grid item must be a direct child of its grid container"]
+  },
+  "layouts": {
+    "navigation": "Visible branded header on every screen; desktop/web shows 3-5 links and CTA, mobile uses logo plus notifications and a five-item bottom tab bar.",
+    "reader_home": ["Header with FreePress wordmark and role-appropriate actions", "Topic rail", "offset lead dispatch with category/time/live state", "stacked feed of text, image, video and live reports", "persistent player only when media is active"],
+    "reporter_studio": ["identity/status header", "large Story/Live segmented control", "composer body and attachment row", "camera preview", "mic/camera device selectors", "publish or go-live action with confirmation"],
+    "admin_queue": ["hard-bottom header", "metrics", "filterable moderation queue", "detail drawer with evidence and history", "audit log and resolution action"],
+    "support_flow": "Show ₹7 as a single clear support choice, explain recurring vs one-time before payment, confirm reporter and amount, then show receipt/status.",
+    "surface_rules": ["Headers have solid or opaque blurred backgrounds, never complete transparent backgrounds", "Reader cards use warm solid surfaces and thin borders, no excessive shadows", "Admin is cardless with rectangular rules and status badges", "Nested radius maximum 12px; controls can be pill-shaped"]
+  },
+  "motion": {
+    "principles": ["Every Pressable has pressed scale/opacity feedback", "Feed entrance uses staggered 80ms fade/translateY", "Live badge uses a subtle pulse plus text label; never rely on motion alone", "Support confirmation uses a brief checkmark transition", "Camera preview transitions between devices with crossfade"],
+    "implementation": "Use Animated or Reanimated with explicit transform/opacity transitions; never use transition: all. Respect reduced motion by disabling parallax, pulse, and stagger.",
+    "loading": "Use content-shaped skeletons for feed and queue; show a labeled connection state for live streaming."
+  },
+  "accessibility": {
+    "requirements": ["Every interactive and key informational element includes a stable data-testid in JS props", "Use accessibilityRole, accessibilityLabel, accessibilityHint, and accessibilityState on Pressable controls", "Support Dynamic Type/font scaling without clipping", "Do not communicate moderation or live status by color alone", "Provide captions/transcripts and mute controls for video/live media", "Confirm destructive moderation actions with consequence text", "Keyboard/focus support for web fallback", "Respect prefers-reduced-motion where available and React Native reduced-motion settings"]
+  },
+  "media": {
+    "policy": "No stock imagery is required for the core UI; user-generated reporting media is the product and should be shown with clear source, timestamp, caption, location consent, and verification status.",
+    "capture": ["Request camera and microphone permissions contextually", "enumerate available cameras and microphones", "front/back camera switch", "torch toggle", "zoom control", "focus/exposure lock", "resolution/frame-rate selector", "mic mute, input level meter, external mic label", "network quality and reconnect state", "landscape lock option for live video"],
+    "fallbacks": ["If permission is denied, explain why and provide settings route", "If device enumeration fails, default to system camera/mic and show status", "If upload fails, persist draft and expose retry", "Always show live stream privacy/location controls before going live"]
+  },
+  "3d_libraries": {
+    "decision": "Not needed for a journalism app: clarity and battery life outweigh immersion.",
+    "optional": "Use Reanimated for lightweight media transitions; do not add R3F, Three.js, or particle backgrounds to reading/reporting flows."
+  },
+  "image_urls": [],
+  "research_references": [
+    {"source":"Mobbin News Feed patterns","descriptors":["tab bar and top navigation", "stacked list and carousel patterns", "save/search/filter/favorite states", "dark mode and empty states"]},
+    {"source":"The Ken redesign case study","descriptors":["content-first editorial hierarchy", "modular layouts adapting to story priority", "premium distraction-free reading"]},
+    {"source":"SaaSFrame 2026 dashboard patterns","descriptors":["operational queues", "modular high-performance dashboards", "status visibility and saved views"]},
+    {"source":"Stream moderation dashboard patterns","descriptors":["context-rich review detail", "severity and prior history", "guarded destructive actions and audit logs"]}
+  ],
+  "instructions_to_main_agent": ["Build the three role experiences as separate route groups with a shared design token module.", "Use real API wiring for auth, posts, live session state, subscriptions, reports, and audit logs; if any endpoint is unavailable, label the UI flow MOCKED rather than implying completion.", "Use data-testid values such as reader-feed-item, reporter-go-live-button, reporter-camera-selector, reporter-mic-selector, support-seven-rupees-button, admin-moderation-queue, admin-resolve-report-button.", "Use Sonner/toast equivalent for success and error feedback; never silently fail.", "Keep payment and live-stream controls explicit about ₹7 pricing, permissions, privacy, connectivity, and failure recovery.", "Do not promise literally uncensored distribution: implement transparent, appealable moderation focused on legality, safety, spam, and platform rules, with audit trails and reporter appeal controls.", "Do not use emoji icons; use the existing icon system or install a consistent icon package.", "Customize scrollbars on web fallback and avoid a centered app container or generic gradients."] ,
+  "GENERAL UI UX DESIGN GUIDELINES": ["Prioritize human-readable content over decoration.", "Use asymmetry, negative space, close-up media, and strong light/rough contrast.", "Use 2-3x generous spacing where content is not dense.", "Every hover, pressed, focus, loading, empty, error, and success state must be designed.", "Never use complete transparent backgrounds behind readable content; use opaque or blurred surfaces.", "Limit primary red to meaningful action/status moments.", "Test all role flows on small screens and slow networks.", "All interactive and key informational elements MUST include data-testid attributes."]
+}
