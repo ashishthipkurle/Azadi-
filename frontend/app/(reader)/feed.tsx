@@ -2,7 +2,7 @@
 // live-now strip, inline Mux media, ₹7 Razorpay support (one-time or monthly),
 // and a "flag for moderation" flow.
 import { useRouter } from "expo-router";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   ActivityIndicator,
   Modal,
@@ -16,10 +16,11 @@ import {
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 
-import { apiGet, apiPost, ApiError } from "@/src/api";
+import { apiDelete, apiGet, apiPost, ApiError } from "@/src/api";
 import { useAuth } from "@/src/auth";
 import { MediaPlayer, type MediaAttachment } from "@/src/media-player";
 import { RazorpayCheckout, type CheckoutOrder } from "@/src/razorpay";
+import { ReaderMenu } from "@/src/reader-menu";
 import { SupportChoiceSheet, type SupportInterval } from "@/src/support-choice";
 import { C } from "@/src/theme";
 import { Button, EmptyState, Icon, Toast } from "@/src/ui";
@@ -35,6 +36,8 @@ type Post = {
   location: string;
   stats: string;
   media?: MediaAttachment[];
+  trending_score?: number;
+  reads_24h?: number;
 };
 type Reporter = {
   id: string;
@@ -57,15 +60,18 @@ const CATEGORIES = ["All", "Field report", "Photo essay", "Dispatch"];
 
 export default function Feed() {
   const router = useRouter();
-  const { user, logout } = useAuth();
-  const [tab, setTab] = useState<"all" | "following">("all");
+  const { user } = useAuth();
+  const [tab, setTab] = useState<"all" | "following" | "trending">("all");
   const [allPosts, setAllPosts] = useState<Post[]>([]);
   const [followingPosts, setFollowingPosts] = useState<Post[]>([]);
+  const [trendingPosts, setTrendingPosts] = useState<Post[]>([]);
+  const [bookmarkIds, setBookmarkIds] = useState<Set<string>>(new Set());
   const [reporters, setReporters] = useState<Reporter[]>([]);
   const [liveSessions, setLiveSessions] = useState<LiveSession[]>([]);
   const [category, setCategory] = useState(0);
   const [refreshing, setRefreshing] = useState(false);
   const [loading, setLoading] = useState(true);
+  const [menuOpen, setMenuOpen] = useState(false);
   const [toast, setToast] = useState<{ message: string; tone: "success" | "error" | "info" } | null>(null);
   const [reporting, setReporting] = useState<Post | null>(null);
   const [reportReason, setReportReason] = useState("");
@@ -74,16 +80,20 @@ export default function Feed() {
 
   const load = useCallback(async () => {
     try {
-      const [p, r, live, following] = await Promise.all([
+      const [p, r, live, following, trending, bookmarks] = await Promise.all([
         apiGet<Post[]>("/feed"),
         apiGet<Reporter[]>("/reporters"),
         apiGet<LiveSession[]>("/live/sessions"),
         apiGet<Post[]>("/feed/following").catch(() => [] as Post[]),
+        apiGet<Post[]>("/feed/trending").catch(() => [] as Post[]),
+        apiGet<{ post_ids: string[] }>("/bookmarks").catch(() => ({ post_ids: [] as string[] })),
       ]);
       setAllPosts(p);
       setReporters(r);
       setLiveSessions(live);
       setFollowingPosts(following);
+      setTrendingPosts(trending);
+      setBookmarkIds(new Set(bookmarks.post_ids));
     } catch {
       setToast({ message: "Could not load the dispatch wall.", tone: "error" });
     } finally {
@@ -95,10 +105,49 @@ export default function Feed() {
     load();
   }, [load]);
 
+  // Record a read for the top-most posts so trending reflects real engagement.
+  const seenRef = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    const currentPosts = tab === "following" ? followingPosts : tab === "trending" ? trendingPosts : allPosts;
+    const toMark = currentPosts.slice(0, 6).filter((p) => !seenRef.current.has(p.id));
+    toMark.forEach((p) => {
+      seenRef.current.add(p.id);
+      apiPost(`/posts/${p.id}/read`).catch(() => {
+        /* trending is best-effort */
+      });
+    });
+  }, [tab, allPosts, followingPosts, trendingPosts]);
+
   const onRefresh = async () => {
     setRefreshing(true);
     await load();
     setRefreshing(false);
+  };
+
+  const toggleBookmark = async (post: Post) => {
+    const isSaved = bookmarkIds.has(post.id);
+    // Optimistic update.
+    setBookmarkIds((prev) => {
+      const next = new Set(prev);
+      isSaved ? next.delete(post.id) : next.add(post.id);
+      return next;
+    });
+    try {
+      if (isSaved) await apiDelete(`/bookmarks/${post.id}`);
+      else await apiPost("/bookmarks", { post_id: post.id });
+      setToast({
+        message: isSaved ? "Removed from your reading list." : "Saved to your reading list.",
+        tone: isSaved ? "info" : "success",
+      });
+    } catch {
+      // Roll back on failure.
+      setBookmarkIds((prev) => {
+        const next = new Set(prev);
+        isSaved ? next.add(post.id) : next.delete(post.id);
+        return next;
+      });
+      setToast({ message: "Bookmark action failed.", tone: "error" });
+    }
   };
 
   const openSupport = (reporter: { id: string; name?: string }) => {
@@ -137,9 +186,10 @@ export default function Feed() {
     }
   };
 
-  const sourcePosts = tab === "following" ? followingPosts : allPosts;
+  const sourcePosts =
+    tab === "following" ? followingPosts : tab === "trending" ? trendingPosts : allPosts;
   const filtered =
-    category === 0
+    category === 0 || tab === "trending"
       ? sourcePosts
       : sourcePosts.filter((p) => p.kind.toLowerCase() === CATEGORIES[category].toLowerCase());
 
@@ -150,8 +200,8 @@ export default function Feed() {
           <Text style={styles.wordmark}>freepress</Text>
           <Text style={styles.kicker}>THE DISPATCH WALL</Text>
         </View>
-        <Pressable testID="reader-logout-button" onPress={logout} style={styles.avatar}>
-          <Icon name="log-out-outline" color={C.surface} size={19} />
+        <Pressable testID="reader-menu-button" onPress={() => setMenuOpen(true)} style={styles.avatar}>
+          <Icon name="ellipsis-horizontal" color={C.surface} size={19} />
         </Pressable>
       </View>
 
@@ -168,7 +218,7 @@ export default function Feed() {
           <Text style={styles.headline}>Today's ground truth.</Text>
 
           <View style={styles.tabRow}>
-            {(["all", "following"] as const).map((t) => (
+            {(["all", "following", "trending"] as const).map((t) => (
               <Pressable
                 key={t}
                 testID={`feed-tab-${t}`}
@@ -176,7 +226,7 @@ export default function Feed() {
                 style={[styles.tab, tab === t && styles.tabActive]}
               >
                 <Text style={[styles.tabText, tab === t && styles.tabTextActive]}>
-                  {t === "all" ? "All" : `Following · ${followingPosts.length}`}
+                  {t === "all" ? "All" : t === "following" ? `Following · ${followingPosts.length}` : "Trending"}
                 </Text>
               </Pressable>
             ))}
@@ -243,7 +293,14 @@ export default function Feed() {
                   <Text style={[styles.postOverline, post.kind === "live now" && { color: C.red }]}>
                     {post.kind.toUpperCase()}
                   </Text>
-                  <Text style={[styles.meta, i === 0 && { color: "#B7BEC5" }]}>{post.location}</Text>
+                  {tab === "trending" && post.reads_24h ? (
+                    <View style={styles.trendingBadge}>
+                      <Icon name="flame" color={C.red} size={12} />
+                      <Text style={styles.trendingBadgeText}>{post.reads_24h} reads · 24h</Text>
+                    </View>
+                  ) : (
+                    <Text style={[styles.meta, i === 0 && { color: "#B7BEC5" }]}>{post.location}</Text>
+                  )}
                 </View>
                 <Text style={[styles.postTitle, i === 0 && styles.leadTitle]}>{post.title}</Text>
                 <Text style={[styles.postBody, i === 0 && styles.leadBody]}>{post.body}</Text>
@@ -278,6 +335,20 @@ export default function Feed() {
                   >
                     <Icon name="heart-outline" color={i === 0 ? C.surface : C.red} size={18} />
                     <Text style={[styles.actionText, i === 0 && { color: C.surface }]}>Support ₹7</Text>
+                  </Pressable>
+                  <Pressable
+                    testID={`reader-bookmark-${post.id}`}
+                    onPress={() => toggleBookmark(post)}
+                    style={styles.action}
+                  >
+                    <Icon
+                      name={bookmarkIds.has(post.id) ? "bookmark" : "bookmark-outline"}
+                      color={i === 0 ? C.surface : bookmarkIds.has(post.id) ? C.blue : C.muted}
+                      size={18}
+                    />
+                    <Text style={[styles.actionText, i === 0 && { color: C.surface }]}>
+                      {bookmarkIds.has(post.id) ? "Saved" : "Save"}
+                    </Text>
                   </Pressable>
                   <Pressable
                     testID="reader-report-button"
@@ -372,6 +443,8 @@ export default function Feed() {
         onChoose={startCheckout}
       />
 
+      <ReaderMenu visible={menuOpen} onClose={() => setMenuOpen(false)} />
+
       <RazorpayCheckout
         visible={!!checkout}
         order={checkout?.order || null}
@@ -464,6 +537,16 @@ const styles = StyleSheet.create({
   leadPost: { backgroundColor: C.ink, borderTopWidth: 0, padding: 20, marginTop: 20, borderRadius: 6 },
   postTop: { flexDirection: "row", justifyContent: "space-between", marginBottom: 12 },
   postOverline: { color: C.muted, fontSize: 10, letterSpacing: 1.6, fontWeight: "800" },
+  trendingBadge: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 4,
+    backgroundColor: "#F5E5E2",
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+    borderRadius: 10,
+  },
+  trendingBadgeText: { color: C.red, fontSize: 10, fontWeight: "800", letterSpacing: 0.5 },
   overline: { color: C.muted, fontSize: 11, letterSpacing: 1.5, fontWeight: "800" },
   postTitle: { color: C.ink, fontSize: 22, lineHeight: 26, fontWeight: "800", letterSpacing: -0.5 },
   leadTitle: { color: C.surface, fontSize: 28, lineHeight: 30 },

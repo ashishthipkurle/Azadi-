@@ -1,0 +1,40 @@
+{
+  "summary": "Backend-only iteration for FreePress iteration-6 (bookmarks, reads/trending, pledges). 67/67 pytest cases pass (52 prior + 15 new). Verified: POST /api/bookmarks — 401 without auth, 404 for unknown post, 200 {ok:true, bookmarked:true} for valid post, idempotent (second call same result and only one entry in GET). DELETE /api/bookmarks/{post_id} returns {ok:true, bookmarked:false}; second delete is no-op. GET /api/bookmarks — 401 without auth, returns {post_ids:[], posts:[]} shape, ordered by created_at desc (most recently bookmarked first), no _id leak. POST /api/posts/{id}/read — 401 without auth, 404 for unknown id, first call returns {ok:true, new:...}, second same-day call returns {ok:true, new:false} (deduped). GET /api/feed/trending — public, list of posts each with id/trending_score/reads_24h, no _id; after recording a read the target post has reads_24h >= 1 and trending_score >= 1. GET /api/support/pledges — 401 without auth, returns [] for reader with no monthly pledges (correct shape when seeded — id, subscription_id, reporter, amount, status, created_at). POST /api/support/pledges/{id}/cancel — 401 without auth, 404 for unknown id, cancels monthly pledge without subscription_id without hitting Razorpay returning {ok:true, status:cancelled}, and returns 503 'coming soon' when pledge has subscription_id but RAZORPAY_KEY_ID is missing. Regression suite (auth, feed, posts CRUD, provider-gated 503, admin moderation, follow, reporter shape, live viewer-token, media, earnings, support intervals) continues to pass.",
+  "backend_issues": {
+    "critical": [],
+    "minor": []
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": [],
+    "react_native_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/backend_test.py",
+    "/app/backend/tests/test_iter4_features.py",
+    "/app/backend/tests/test_iter5_features.py",
+    "/app/backend/tests/test_iter6_features.py",
+    "/app/test_reports/pytest/iteration_6_results.xml"
+  ],
+  "action_items": [],
+  "critical_code_review_comments": [
+    "server.py POST /api/bookmarks correctly uses upsert with $setOnInsert so idempotency preserves the original created_at. Good pattern.",
+    "server.py POST /api/posts/{id}/read composes a natural key `${post_id}:${user}:${day}` and upserts — dedupe works without needing a unique index; adding an index on `reads.key` and `bookmarks.(user_id,post_id)` would be a nice hardening for scale but not required for correctness.",
+    "server.py GET /api/feed/trending public endpoint aggregates reads over the last 24h and injects computed `trending_score`/`reads_24h` per-post; supports contribute via reporter_id (not post_id), so a reporter's other posts also benefit — this is intentional per the docstring but worth documenting for UX/PMs.",
+    "server.py POST /api/support/pledges/{id}/cancel short-circuits with {ok:true, status:cancelled} when already cancelled — good idempotency. When subscription_id is present it calls provider_required BEFORE the try/except, so missing Razorpay keys yield 503 (correct). Razorpay failure translates to 502 which is appropriate.",
+    "server.py GET /api/support/pledges filters by supporter_id + interval=monthly + status in {pending,verified,active}. 'active' is used in the query but never written by the current code paths — harmless but confirms future-proofing intent.",
+    "Still on deprecated @app.on_event('startup'/'shutdown'); non-blocking cleanup — migrate to FastAPI lifespan handlers."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_iter6_features.py (new)",
+    "/app/test_reports/iteration_6.json",
+    "/app/test_reports/pytest/iteration_6_results.xml"
+  ],
+  "success_rate": {"backend": "100% (67/67 pytest tests)", "frontend": "not tested (backend-only scope)"},
+  "seed_data_creation": "test_iter6_features.py: creates TEST posts via API (cleaned in finally / module fixture teardown), and inserts TEST-pledge-<uuid> docs into `supports` collection via pymongo (MONGO_URL/DB_NAME) for the two pledge cancellation paths (with/without subscription_id). Cleanup uses regex `^TEST-pledge-` delete_many in a finally block. No orphan data expected.",
+  "retest_needed": false,
+  "should_main_agent_self_test": true,
+  "context_for_next_testing_agent": "Suite runs under EXPO_PUBLIC_BACKEND_URL (must be exported before pytest). Also export MONGO_URL and DB_NAME to enable the two pledge-cancellation tests that seed directly via pymongo; they skip cleanly if these are absent. Files: /app/backend/tests/{backend_test.py, test_iter4_features.py, test_iter5_features.py, test_iter6_features.py}. Command: `EXPO_PUBLIC_BACKEND_URL=$EXPO_PUBLIC_BACKEND_URL MONGO_URL=$MONGO_URL DB_NAME=$DB_NAME python -m pytest /app/backend/tests/ -v`. First parallel run showed 2 flaky failures (ConnectTimeout to preview host); serial re-run passed 67/67 in 13.79s — the preview ingress occasionally throttles bursts, treat isolated ConnectTimeout as network flakiness not a backend defect.",
+  "rca_of_issue": "N/A — no functional failures. Flaky ConnectTimeout observed once under high parallelism against the preview host (Kubernetes ingress); rerun in serial or with tighter concurrency is clean."
+}

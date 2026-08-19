@@ -110,6 +110,10 @@ class UploadCreate(BaseModel):
     content_type: str
 
 
+class BookmarkCreate(BaseModel):
+    post_id: str
+
+
 def public_user(user: dict) -> dict:
     return {"id": user["id"], "name": user["name"], "email": user["email"], "role": user["role"], "verified": user.get("verified", False)}
 
@@ -252,6 +256,92 @@ async def feed_following(user: dict = Depends(current_user)):
     if not ids:
         return []
     return await db.posts.find({"reporter_id": {"$in": ids}}, {"_id": 0}).sort("created_at", -1).to_list(100)
+
+
+@api_router.get("/feed/trending")
+async def feed_trending():
+    """Rank posts by (reads + supports*3) in the past 24 hours.
+    Support counts more than a read because it's a stronger signal, but we
+    don't allow paid promotion to influence ranking beyond genuine reader
+    interest."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+
+    read_counts: dict[str, int] = {}
+    async for row in db.reads.aggregate([
+        {"$match": {"created_at": {"$gte": cutoff}}},
+        {"$group": {"_id": "$post_id", "count": {"$sum": 1}}},
+    ]):
+        read_counts[row["_id"]] = row["count"]
+
+    support_counts: dict[str, int] = {}
+    async for row in db.supports.aggregate([
+        {"$match": {"status": "verified", "verified_at": {"$gte": cutoff}}},
+        {"$group": {"_id": "$reporter_id", "count": {"$sum": 1}}},
+    ]):
+        support_counts[row["_id"]] = row["count"]
+
+    posts = await db.posts.find({"created_at": {"$gte": cutoff}}, {"_id": 0}).to_list(200)
+    # Include any older post that got engagement in the window too.
+    if read_counts:
+        older = await db.posts.find(
+            {"id": {"$in": list(read_counts.keys())}, "created_at": {"$lt": cutoff}}, {"_id": 0},
+        ).to_list(200)
+        seen = {p["id"] for p in posts}
+        for p in older:
+            if p["id"] not in seen:
+                posts.append(p)
+
+    def score(post: dict) -> int:
+        return read_counts.get(post["id"], 0) + support_counts.get(post["reporter_id"], 0) * 3
+
+    ranked = sorted(posts, key=lambda p: (score(p), p["created_at"]), reverse=True)
+    return [{**p, "trending_score": score(p), "reads_24h": read_counts.get(p["id"], 0)} for p in ranked[:40]]
+
+
+@api_router.post("/posts/{post_id}/read")
+async def mark_read(post_id: str, user: dict = Depends(current_user)):
+    """Record a read for trending. De-duped per (viewer, post, day) so refresh
+    spam doesn't skew the ranking."""
+    if not await db.posts.find_one({"id": post_id}, {"_id": 0, "id": 1}):
+        raise HTTPException(404, "Post not found")
+    day = datetime.now(timezone.utc).date().isoformat()
+    key = f"{post_id}:{user['id']}:{day}"
+    result = await db.reads.update_one(
+        {"key": key},
+        {"$setOnInsert": {"key": key, "post_id": post_id, "viewer_id": user["id"], "created_at": now()}},
+        upsert=True,
+    )
+    return {"ok": True, "new": result.upserted_id is not None}
+
+
+@api_router.post("/bookmarks")
+async def create_bookmark(payload: BookmarkCreate, user: dict = Depends(current_user)):
+    if not await db.posts.find_one({"id": payload.post_id}, {"_id": 0, "id": 1}):
+        raise HTTPException(404, "Post not found")
+    await db.bookmarks.update_one(
+        {"user_id": user["id"], "post_id": payload.post_id},
+        {"$setOnInsert": {"user_id": user["id"], "post_id": payload.post_id, "created_at": now()}},
+        upsert=True,
+    )
+    return {"ok": True, "bookmarked": True}
+
+
+@api_router.delete("/bookmarks/{post_id}")
+async def delete_bookmark(post_id: str, user: dict = Depends(current_user)):
+    await db.bookmarks.delete_one({"user_id": user["id"], "post_id": post_id})
+    return {"ok": True, "bookmarked": False}
+
+
+@api_router.get("/bookmarks")
+async def list_bookmarks(user: dict = Depends(current_user)):
+    rows = await db.bookmarks.find({"user_id": user["id"]}, {"_id": 0}).sort("created_at", -1).to_list(200)
+    if not rows:
+        return {"post_ids": [], "posts": []}
+    post_ids = [r["post_id"] for r in rows]
+    posts = await db.posts.find({"id": {"$in": post_ids}}, {"_id": 0}).to_list(200)
+    order = {pid: idx for idx, pid in enumerate(post_ids)}
+    posts.sort(key=lambda p: order.get(p["id"], 9999))
+    return {"post_ids": post_ids, "posts": posts}
 
 
 async def _support_totals(reporter_ids: list[str]) -> dict[str, int]:
@@ -645,6 +735,62 @@ async def verify_support(payload: dict, user: dict = Depends(require_roles("clie
         {"$set": {"payment_id": payment_id, "status": "verified", "verified_at": now()}},
     )
     return {"ok": True, "status": "verified"}
+
+
+@api_router.get("/support/pledges")
+async def list_pledges(user: dict = Depends(current_user)):
+    """Return the caller's monthly support pledges, one row per subscription."""
+    rows = await db.supports.find(
+        {
+            "supporter_id": user["id"],
+            "interval": "monthly",
+            "status": {"$in": ["pending", "verified", "active"]},
+        },
+        {"_id": 0},
+    ).sort("created_at", -1).to_list(50)
+    reporter_ids = list({r["reporter_id"] for r in rows})
+    reporters = {}
+    if reporter_ids:
+        async for u in db.users.find(
+            {"id": {"$in": reporter_ids}}, {"_id": 0, "id": 1, "name": 1, "verified": 1},
+        ):
+            reporters[u["id"]] = u
+    return [
+        {
+            "id": r["id"],
+            "subscription_id": r.get("subscription_id"),
+            "reporter": reporters.get(r["reporter_id"]) or {"id": r["reporter_id"], "name": "Unknown"},
+            "amount": r["amount"],
+            "status": r["status"],
+            "created_at": r["created_at"],
+        }
+        for r in rows
+    ]
+
+
+@api_router.post("/support/pledges/{pledge_id}/cancel")
+async def cancel_pledge(pledge_id: str, user: dict = Depends(current_user)):
+    pledge = await db.supports.find_one({"id": pledge_id, "supporter_id": user["id"]}, {"_id": 0})
+    if not pledge:
+        raise HTTPException(404, "Pledge not found")
+    if pledge.get("interval") != "monthly":
+        raise HTTPException(400, "Only monthly pledges can be cancelled")
+    if pledge.get("status") == "cancelled":
+        return {"ok": True, "status": "cancelled"}
+    subscription_id = pledge.get("subscription_id")
+    # If the pledge was created against Razorpay, tell them to stop billing.
+    if subscription_id:
+        provider_required("RAZORPAY_KEY_ID", "RAZORPAY_KEY_SECRET")
+        gateway = razorpay.Client(auth=(os.environ["RAZORPAY_KEY_ID"], os.environ["RAZORPAY_KEY_SECRET"]))
+        try:
+            gateway.subscription.cancel(subscription_id, {"cancel_at_cycle_end": 0})
+        except Exception:
+            raise HTTPException(502, "Razorpay could not cancel this subscription")
+    await db.supports.update_one(
+        {"id": pledge_id},
+        {"$set": {"status": "cancelled", "cancelled_at": now()}},
+    )
+    return {"ok": True, "status": "cancelled"}
 
 
 @api_router.post("/webhooks/razorpay")
