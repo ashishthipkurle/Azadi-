@@ -1,33 +1,51 @@
 // Reporter studio:
-// - "Story" mode publishes text posts via POST /api/posts.
-// - "Live" mode reserves a room via POST /api/live/token (real LiveKit token when
-//   backend has keys, or a friendly 503 message otherwise) and drives an
-//   expo-camera preview so reporters can physically point the camera before
-//   broadcasting.
-// Camera / mic permissions are requested contextually only when the reporter
-// switches to "Live".
-import { useCameraPermissions, useMicrophonePermissions, CameraView } from "expo-camera";
-import { useCallback, useEffect, useState } from "react";
+// - "Write" mode publishes text posts via POST /api/posts, with optional Mux
+//   media attachments (image or video, uploaded via /api/media/upload-url).
+// - "Go live" mode requests a LiveKit token from POST /api/live/token, then
+//   connects to the room and publishes camera + mic tracks.
+//
+// Both flows fall back to a friendly "coming soon" message when the backend
+// returns HTTP 503 (provider keys not yet configured).
+import * as ImagePicker from "expo-image-picker";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   KeyboardAvoidingView,
+  Linking,
   Platform,
   Pressable,
+  RefreshControl,
   ScrollView,
   StyleSheet,
   Text,
   TextInput,
   View,
-  Linking,
-  RefreshControl,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 
 import { apiDelete, apiGet, apiPost, ApiError } from "@/src/api";
 import { useAuth } from "@/src/auth";
+import { LiveStage } from "@/src/live-stage";
+import { publishLive, type LiveConnection } from "@/src/livekit";
+import { uploadToMux } from "@/src/mux";
 import { C } from "@/src/theme";
 import { Button, EmptyState, Icon, Toast } from "@/src/ui";
 
-type MyPost = { id: string; title: string; body: string; kind: string; created_at: string; verified: boolean };
+type MyPost = {
+  id: string;
+  title: string;
+  body: string;
+  kind: string;
+  created_at: string;
+  verified: boolean;
+  media?: { kind: string; playback_id?: string; url?: string }[];
+};
+
+type Attachment = {
+  kind: "image" | "video";
+  local_uri: string;
+  playback_id?: string;
+  status: "uploading" | "processing" | "ready" | "error";
+};
 
 export default function Studio() {
   const { user, logout } = useAuth();
@@ -35,29 +53,90 @@ export default function Studio() {
   const [title, setTitle] = useState("");
   const [body, setBody] = useState("");
   const [kind, setKind] = useState<"field report" | "photo essay" | "dispatch">("dispatch");
-  const [facing, setFacing] = useState<"back" | "front">("back");
-  const [mic, setMic] = useState<"phone" | "external">("phone");
-  const [liveSession, setLiveSession] = useState<{ room: string; url: string; token: string; id?: string } | null>(null);
+  const [attachments, setAttachments] = useState<Attachment[]>([]);
+  const [connection, setConnection] = useState<LiveConnection | null>(null);
+  const [sessionMeta, setSessionMeta] = useState<{ room: string } | null>(null);
+  const [localVideoTrack, setLocalVideoTrack] = useState<any>(null);
   const [posts, setPosts] = useState<MyPost[]>([]);
   const [refreshing, setRefreshing] = useState(false);
   const [busy, setBusy] = useState(false);
   const [toast, setToast] = useState<{ message: string; tone: "success" | "error" | "info" } | null>(null);
-
-  const [camPerm, requestCam] = useCameraPermissions();
-  const [micPerm, requestMic] = useMicrophonePermissions();
+  const disconnectingRef = useRef(false);
 
   const loadPosts = useCallback(async () => {
     try {
       const p = await apiGet<MyPost[]>("/posts/mine");
       setPosts(p);
     } catch {
-      // silent — the composer still works
+      /* silent */
     }
   }, []);
 
   useEffect(() => {
     loadPosts();
   }, [loadPosts]);
+
+  // Clean up any live connection when the studio unmounts.
+  useEffect(() => {
+    return () => {
+      if (connection) connection.disconnect().catch(() => {});
+    };
+  }, [connection]);
+
+  const attachMedia = async (variant: "image" | "video") => {
+    const perm = await ImagePicker.requestMediaLibraryPermissionsAsync();
+    if (!perm.granted) {
+      if (!perm.canAskAgain) {
+        setToast({ message: "Enable photo access in Settings to attach media.", tone: "error" });
+        Linking.openSettings();
+      } else {
+        setToast({ message: "Photo access is needed to attach media.", tone: "info" });
+      }
+      return;
+    }
+    const result = await ImagePicker.launchImageLibraryAsync({
+      mediaTypes:
+        variant === "image"
+          ? ImagePicker.MediaTypeOptions.Images
+          : ImagePicker.MediaTypeOptions.Videos,
+      quality: 0.8,
+    });
+    if (result.canceled || !result.assets?.length) return;
+    const asset = result.assets[0];
+    const entry: Attachment = { kind: variant, local_uri: asset.uri, status: "uploading" };
+    setAttachments((prev) => [...prev, entry]);
+    try {
+      const media = await uploadToMux(
+        {
+          uri: asset.uri,
+          fileName: asset.fileName || undefined,
+          mimeType: asset.mimeType || undefined,
+        },
+        (phase) => {
+          setAttachments((prev) =>
+            prev.map((a) => (a.local_uri === asset.uri ? { ...a, status: phase } : a)),
+          );
+        },
+      );
+      setAttachments((prev) =>
+        prev.map((a) =>
+          a.local_uri === asset.uri
+            ? { ...a, status: media.playback_id ? "ready" : "processing", playback_id: media.playback_id }
+            : a,
+        ),
+      );
+      if (!media.playback_id) {
+        setToast({ message: "Mux is still processing — you can publish and it'll appear soon.", tone: "info" });
+      }
+    } catch (e) {
+      setAttachments((prev) => prev.map((a) => (a.local_uri === asset.uri ? { ...a, status: "error" } : a)));
+      const message = e instanceof ApiError ? e.message : "Upload failed.";
+      setToast({ message, tone: e instanceof ApiError && e.status === 503 ? "info" : "error" });
+    }
+  };
+
+  const removeAttachment = (uri: string) =>
+    setAttachments((prev) => prev.filter((a) => a.local_uri !== uri));
 
   const publish = async () => {
     if (title.trim().length < 4) {
@@ -68,11 +147,26 @@ export default function Studio() {
       setToast({ message: "Write at least a sentence from the field.", tone: "error" });
       return;
     }
+    const uploading = attachments.filter((a) => a.status === "uploading");
+    if (uploading.length) {
+      setToast({ message: "Wait for uploads to finish before publishing.", tone: "info" });
+      return;
+    }
     setBusy(true);
     try {
-      await apiPost("/posts", { title: title.trim(), body: body.trim(), kind, location: "On the ground" });
+      const media = attachments
+        .filter((a) => a.status === "ready" || a.status === "processing")
+        .map((a) => ({ kind: a.kind, playback_id: a.playback_id }));
+      await apiPost("/posts", {
+        title: title.trim(),
+        body: body.trim(),
+        kind,
+        location: "On the ground",
+        media,
+      });
       setTitle("");
       setBody("");
+      setAttachments([]);
       setToast({ message: "Dispatch published to the wall.", tone: "success" });
       await loadPosts();
     } catch (e) {
@@ -83,51 +177,51 @@ export default function Studio() {
     }
   };
 
-  const askCameraMic = async (): Promise<boolean> => {
-    if (!camPerm?.granted) {
-      const r = await requestCam();
-      if (!r.granted) {
-        if (!r.canAskAgain) {
-          setToast({ message: "Enable camera access in Settings to go live.", tone: "error" });
-          Linking.openSettings();
-        }
-        return false;
-      }
-    }
-    if (!micPerm?.granted) {
-      const r = await requestMic();
-      if (!r.granted) {
-        if (!r.canAskAgain) {
-          setToast({ message: "Enable microphone access in Settings to go live.", tone: "error" });
-          Linking.openSettings();
-        }
-        return false;
-      }
-    }
-    return true;
-  };
-
   const goLive = async () => {
-    const ok = await askCameraMic();
-    if (!ok) return;
     setBusy(true);
     try {
       const res = await apiPost<{ token: string; url: string; room: string }>("/live/token", {
         title: title.trim() || "Live from the field",
       });
-      setLiveSession({ ...res });
-      setToast({ message: `Connected to room ${res.room}.`, tone: "success" });
+      const conn = await publishLive({ url: res.url, token: res.token });
+      setConnection(conn);
+      setSessionMeta({ room: res.room });
+      // Grab the local video track once it's published so we can preview it.
+      const attach = () => {
+        const pub = conn.room.localParticipant.getTrackPublication?.((globalThis as any).LKKind?.Video || "video");
+        if (pub?.track) setLocalVideoTrack(pub.track);
+      };
+      attach();
+      setTimeout(attach, 500);
+      setTimeout(attach, 1500);
+      setToast({ message: `Live in room ${res.room.slice(-6)}. Readers can watch now.`, tone: "success" });
     } catch (e) {
-      const message = e instanceof ApiError ? e.message : "Could not start live.";
-      setToast({ message, tone: e instanceof ApiError && e.status === 503 ? "info" : "error" });
+      const message =
+        e instanceof ApiError
+          ? e.message
+          : e instanceof Error
+            ? `Live could not start: ${e.message}`
+            : "Live could not start.";
+      const tone = e instanceof ApiError && e.status === 503 ? "info" : "error";
+      setToast({ message, tone });
     } finally {
       setBusy(false);
     }
   };
 
-  const endLive = () => {
-    setLiveSession(null);
-    setToast({ message: "Live session ended.", tone: "info" });
+  const endLive = async () => {
+    if (disconnectingRef.current) return;
+    disconnectingRef.current = true;
+    try {
+      if (connection) await connection.disconnect();
+    } catch {
+      /* ignore */
+    }
+    setConnection(null);
+    setLocalVideoTrack(null);
+    setSessionMeta(null);
+    setToast({ message: "Broadcast ended.", tone: "info" });
+    disconnectingRef.current = false;
   };
 
   const deletePost = async (id: string) => {
@@ -224,12 +318,37 @@ export default function Studio() {
                 ))}
               </View>
 
-              <View style={styles.notice}>
-                <Icon name="information-circle-outline" color={C.blue} size={17} />
-                <Text style={styles.noticeText}>
-                  Uploading photos and video is coming soon — we're wiring the media pipeline.
-                </Text>
+              <Text style={styles.overline}>ATTACHMENTS</Text>
+              <View style={styles.attachRow}>
+                <Pressable testID="reporter-attach-image" onPress={() => attachMedia("image")} style={styles.attachBtn}>
+                  <Icon name="image-outline" color={C.red} size={18} />
+                  <Text style={styles.attachText}>Photo</Text>
+                </Pressable>
+                <Pressable testID="reporter-attach-video" onPress={() => attachMedia("video")} style={styles.attachBtn}>
+                  <Icon name="videocam-outline" color={C.red} size={18} />
+                  <Text style={styles.attachText}>Video</Text>
+                </Pressable>
               </View>
+
+              {attachments.map((a) => (
+                <View key={a.local_uri} style={styles.attachTile}>
+                  <View style={styles.attachThumb}>
+                    <Icon name={a.kind === "image" ? "image" : "film"} color={C.surface} size={18} />
+                  </View>
+                  <View style={{ flex: 1 }}>
+                    <Text style={styles.attachTileName} numberOfLines={1}>{a.local_uri.split("/").pop()}</Text>
+                    <Text style={[styles.attachTileStatus, a.status === "error" && { color: C.red }, a.status === "ready" && { color: C.green }]}>
+                      {a.status === "uploading" && "Uploading to Mux…"}
+                      {a.status === "processing" && "Processing…"}
+                      {a.status === "ready" && "Ready ✓"}
+                      {a.status === "error" && "Failed"}
+                    </Text>
+                  </View>
+                  <Pressable testID={`reporter-remove-${a.local_uri}`} onPress={() => removeAttachment(a.local_uri)} style={styles.iconBtn}>
+                    <Icon name="close" color={C.muted} size={18} />
+                  </Pressable>
+                </View>
+              ))}
 
               <Button testID="reporter-publish-button" onPress={publish} loading={busy}>
                 Publish dispatch
@@ -244,8 +363,11 @@ export default function Studio() {
                     <View style={{ flex: 1 }}>
                       <Text style={styles.postRowKind}>{p.kind.toUpperCase()}</Text>
                       <Text style={styles.postRowTitle} numberOfLines={2}>{p.title}</Text>
+                      {p.media?.length ? (
+                        <Text style={styles.postRowMeta}>{p.media.length} attachment{p.media.length > 1 ? "s" : ""}</Text>
+                      ) : null}
                     </View>
-                    <Pressable testID={`reporter-delete-${p.id}`} onPress={() => deletePost(p.id)} style={styles.deleteBtn}>
+                    <Pressable testID={`reporter-delete-${p.id}`} onPress={() => deletePost(p.id)} style={styles.iconBtn}>
                       <Icon name="trash-outline" color={C.red} size={17} />
                     </Pressable>
                   </View>
@@ -256,85 +378,47 @@ export default function Studio() {
             <>
               <Text style={styles.title}>Go live, stay connected.</Text>
 
-              <View style={styles.cameraFrame}>
-                {camPerm?.granted && liveSession ? (
-                  <CameraView
-                    style={StyleSheet.absoluteFill}
-                    facing={facing}
-                    mode="video"
-                    videoQuality="1080p"
-                  />
-                ) : camPerm?.granted ? (
-                  <CameraView style={StyleSheet.absoluteFill} facing={facing} />
-                ) : (
-                  <View style={styles.cameraPlaceholder}>
-                    <Icon name="videocam-off-outline" color={C.surface} size={36} />
-                    <Text style={styles.previewText}>Camera preview</Text>
-                    <Text style={styles.previewSub}>Grant camera access to see your framing.</Text>
-                    <Pressable
-                      testID="reporter-request-camera"
-                      onPress={askCameraMic}
-                      style={styles.grantButton}
-                    >
-                      <Text style={styles.grantButtonText}>Enable camera & mic</Text>
-                    </Pressable>
-                  </View>
-                )}
-                {liveSession ? (
-                  <View style={styles.livePill}>
-                    <View style={styles.liveDot} />
-                    <Text style={styles.livePillText}>LIVE · {liveSession.room.slice(-6).toUpperCase()}</Text>
-                  </View>
-                ) : (
-                  <View style={styles.readyPill}>
-                    <Text style={styles.readyText}>READY</Text>
-                  </View>
-                )}
-              </View>
-
-              <TextInput
-                testID="reporter-live-title"
-                value={title}
-                onChangeText={setTitle}
-                placeholder="Stream title (e.g. Live from the factory gate)"
-                placeholderTextColor="#8A8F91"
-                style={styles.inputTitle}
-              />
-
-              <View style={styles.controlPanel}>
-                <ControlRow
-                  icon="camera-reverse-outline"
-                  label="Camera"
-                  value={facing === "back" ? "Back" : "Front"}
-                  onPress={() => setFacing(facing === "back" ? "front" : "back")}
-                  testID="reporter-camera-selector"
-                />
-                <ControlRow
-                  icon="mic-outline"
-                  label="Microphone"
-                  value={mic === "phone" ? "Phone mic" : "External mic"}
-                  onPress={() => setMic(mic === "phone" ? "external" : "phone")}
-                  testID="reporter-mic-selector"
-                />
-                <ControlRow icon="settings-outline" label="Quality" value="1080p · 30fps" onPress={() => {}} />
-              </View>
-
-              {liveSession ? (
-                <Button testID="reporter-end-live-button" onPress={endLive} tone="outline">
-                  End broadcast
-                </Button>
+              {connection ? (
+                <>
+                  <LiveStage track={localVideoTrack} label={`LIVE · ${sessionMeta?.room?.slice(-6).toUpperCase() || ""}`} />
+                  <Text style={styles.helperText}>
+                    Your camera and mic are streaming to LiveKit. Share the room code with readers or check the Live tab.
+                  </Text>
+                  <Button testID="reporter-end-live-button" onPress={endLive} tone="outline">
+                    End broadcast
+                  </Button>
+                </>
               ) : (
-                <Button testID="reporter-go-live-button" onPress={goLive} tone="red" loading={busy}>
-                  Start live stream
-                </Button>
-              )}
+                <>
+                  <View style={styles.cameraPlaceholder}>
+                    <Icon name="radio-outline" color={C.surface} size={38} />
+                    <Text style={styles.previewText}>Ready to broadcast</Text>
+                    <Text style={styles.previewSub}>
+                      Tap Start to request camera + mic and open a LiveKit room. Readers see it instantly under Live now.
+                    </Text>
+                  </View>
 
-              <View style={styles.notice}>
-                <Icon name="shield-checkmark-outline" color={C.blue} size={17} />
-                <Text style={styles.noticeText}>
-                  Location and consent controls appear before you go live. Your camera preview is on-device.
-                </Text>
-              </View>
+                  <TextInput
+                    testID="reporter-live-title"
+                    value={title}
+                    onChangeText={setTitle}
+                    placeholder="Stream title (e.g. Live from the factory gate)"
+                    placeholderTextColor="#8A8F91"
+                    style={styles.inputTitle}
+                  />
+
+                  <Button testID="reporter-go-live-button" onPress={goLive} tone="red" loading={busy}>
+                    Start live stream
+                  </Button>
+
+                  <View style={styles.notice}>
+                    <Icon name="shield-checkmark-outline" color={C.blue} size={17} />
+                    <Text style={styles.noticeText}>
+                      Broadcasting uses WebRTC. In the web preview it publishes from your browser. On a phone you'll need a dev build (Publish → Generate build) for native WebRTC.
+                    </Text>
+                  </View>
+                </>
+              )}
             </>
           )}
         </ScrollView>
@@ -342,33 +426,6 @@ export default function Studio() {
 
       {toast ? <Toast message={toast.message} tone={toast.tone} onDismiss={() => setToast(null)} /> : null}
     </SafeAreaView>
-  );
-}
-
-function ControlRow({
-  icon,
-  label,
-  value,
-  onPress,
-  testID,
-}: {
-  icon: any;
-  label: string;
-  value: string;
-  onPress: () => void;
-  testID?: string;
-}) {
-  return (
-    <Pressable
-      testID={testID}
-      onPress={onPress}
-      style={({ pressed }) => [styles.controlRow, pressed && { opacity: 0.7 }]}
-    >
-      <Icon name={icon} color={C.ink} size={19} />
-      <Text style={styles.controlLabel}>{label}</Text>
-      <Text style={styles.controlValue}>{value}</Text>
-      <Icon name="chevron-forward" color={C.muted} size={17} />
-    </Pressable>
   );
 }
 
@@ -435,6 +492,40 @@ const styles = StyleSheet.create({
   kindChipActive: { backgroundColor: C.ink, borderColor: C.ink },
   kindChipText: { color: C.muted, fontSize: 12, fontWeight: "700" },
   kindChipTextActive: { color: C.surface },
+  attachRow: { flexDirection: "row", gap: 10, marginBottom: 12 },
+  attachBtn: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    borderWidth: 1,
+    borderColor: C.line,
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    borderRadius: 6,
+    backgroundColor: C.surface,
+  },
+  attachText: { color: C.ink, fontSize: 12, fontWeight: "800" },
+  attachTile: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 12,
+    backgroundColor: C.surface,
+    borderWidth: 1,
+    borderColor: C.line,
+    padding: 10,
+    marginBottom: 8,
+    borderRadius: 6,
+  },
+  attachThumb: {
+    width: 42,
+    height: 42,
+    backgroundColor: C.dark,
+    alignItems: "center",
+    justifyContent: "center",
+    borderRadius: 4,
+  },
+  attachTileName: { color: C.ink, fontSize: 13, fontWeight: "700" },
+  attachTileStatus: { color: C.muted, fontSize: 11, marginTop: 3 },
   notice: {
     flexDirection: "row",
     gap: 9,
@@ -458,61 +549,19 @@ const styles = StyleSheet.create({
   },
   postRowKind: { color: C.muted, fontSize: 10, letterSpacing: 1.5, fontWeight: "800", marginBottom: 4 },
   postRowTitle: { color: C.ink, fontSize: 14, fontWeight: "800" },
-  deleteBtn: { padding: 8 },
-  cameraFrame: {
-    height: 280,
+  postRowMeta: { color: C.muted, fontSize: 11, marginTop: 3 },
+  iconBtn: { padding: 8 },
+  cameraPlaceholder: {
+    height: 220,
     backgroundColor: C.dark,
     marginBottom: 16,
     borderRadius: 8,
-    overflow: "hidden",
-    position: "relative",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 8,
+    padding: 20,
   },
-  cameraPlaceholder: { flex: 1, alignItems: "center", justifyContent: "center", gap: 8, padding: 20 },
   previewText: { color: C.surface, fontWeight: "800", fontSize: 17 },
-  previewSub: { color: "#B7BEC5", fontSize: 12, textAlign: "center" },
-  grantButton: { backgroundColor: C.surface, paddingHorizontal: 14, paddingVertical: 10, borderRadius: 6, marginTop: 8 },
-  grantButtonText: { color: C.ink, fontWeight: "800", fontSize: 12 },
-  livePill: {
-    position: "absolute",
-    top: 12,
-    left: 12,
-    flexDirection: "row",
-    gap: 6,
-    alignItems: "center",
-    backgroundColor: "rgba(0,0,0,0.55)",
-    paddingHorizontal: 10,
-    paddingVertical: 5,
-    borderRadius: 12,
-  },
-  liveDot: { backgroundColor: C.red, width: 7, height: 7, borderRadius: 4 },
-  livePillText: { color: C.surface, fontSize: 10, fontWeight: "800", letterSpacing: 1 },
-  readyPill: {
-    position: "absolute",
-    top: 12,
-    left: 12,
-    backgroundColor: "rgba(0,0,0,0.55)",
-    paddingHorizontal: 10,
-    paddingVertical: 5,
-    borderRadius: 12,
-  },
-  readyText: { color: C.surface, fontSize: 10, fontWeight: "800", letterSpacing: 1 },
-  controlPanel: {
-    backgroundColor: C.surface,
-    borderWidth: 1,
-    borderColor: C.line,
-    marginBottom: 16,
-    borderRadius: 6,
-    overflow: "hidden",
-  },
-  controlRow: {
-    minHeight: 54,
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 12,
-    paddingHorizontal: 14,
-    borderBottomWidth: 1,
-    borderBottomColor: C.line,
-  },
-  controlLabel: { color: C.ink, fontWeight: "700", flex: 1, fontSize: 14 },
-  controlValue: { color: C.muted, fontSize: 12 },
+  previewSub: { color: "#B7BEC5", fontSize: 12, textAlign: "center", lineHeight: 18 },
+  helperText: { color: C.muted, fontSize: 12, marginTop: 12, marginBottom: 8, lineHeight: 18 },
 });

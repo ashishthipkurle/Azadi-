@@ -13,7 +13,8 @@
       "bundleIdentifier": "com.emergent.reporterhub.hyfqet",
       "infoPlist": {
         "NSCameraUsageDescription": "Camera access lets reporters publish field reports.",
-        "NSMicrophoneUsageDescription": "Microphone access lets reporters record audio."
+        "NSMicrophoneUsageDescription": "Microphone access lets reporters record audio.",
+        "NSPhotoLibraryUsageDescription": "Attach photos and video to dispatches."
       }
     },
     "android": {

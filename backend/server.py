@@ -72,11 +72,20 @@ class Login(BaseModel):
     password: str
 
 
+class PostMedia(BaseModel):
+    kind: str  # "image" | "video"
+    playback_id: Optional[str] = None
+    asset_id: Optional[str] = None
+    url: Optional[str] = None
+    upload_id: Optional[str] = None
+
+
 class PostCreate(BaseModel):
     title: str
     body: str
     kind: str = "dispatch"
     location: str = "On the ground"
+    media: list[PostMedia] = []
 
 
 class SupportCreate(BaseModel):
@@ -235,16 +244,42 @@ async def feed():
     return await db.posts.find({}, {"_id": 0}).sort("created_at", -1).to_list(50)
 
 
+async def _support_totals(reporter_ids: list[str]) -> dict[str, int]:
+    if not reporter_ids:
+        return {}
+    pipeline = [
+        {"$match": {"reporter_id": {"$in": reporter_ids}, "status": "verified"}},
+        {"$group": {"_id": "$reporter_id", "total": {"$sum": "$amount"}, "count": {"$sum": 1}}},
+    ]
+    out: dict[str, int] = {}
+    async for row in db.supports.aggregate(pipeline):
+        out[row["_id"]] = row["total"]
+    return out
+
+
+async def _follower_count(reporter_id: str) -> int:
+    return await db.follows.count_documents({"reporter_id": reporter_id})
+
+
 @api_router.get("/reporters")
 async def list_reporters():
     users = await db.users.find({"role": "reporter", "disabled": {"$ne": True}}, {"_id": 0, "password_hash": 0}).to_list(50)
+    ids = [u["id"] for u in users]
+    totals = await _support_totals(ids)
+    follower_counts: dict[str, int] = {}
+    async for row in db.follows.aggregate([
+        {"$match": {"reporter_id": {"$in": ids}}},
+        {"$group": {"_id": "$reporter_id", "count": {"$sum": 1}}},
+    ]):
+        follower_counts[row["_id"]] = row["count"]
     return [
         {
             "id": u["id"],
             "name": u["name"],
             "beat": u.get("beat", "Independent reporting"),
             "location": u.get("location", "India"),
-            "followers": u.get("followers", 0),
+            "followers": follower_counts.get(u["id"], 0),
+            "support_total": totals.get(u["id"], 0),
             "verified": u.get("verified", False),
         }
         for u in users
@@ -252,12 +287,52 @@ async def list_reporters():
 
 
 @api_router.get("/reporters/{reporter_id}")
-async def get_reporter(reporter_id: str):
+async def get_reporter(reporter_id: str, credentials: HTTPAuthorizationCredentials = Depends(bearer)):
     user = await db.users.find_one({"id": reporter_id, "role": "reporter"}, {"_id": 0, "password_hash": 0})
     if not user:
         raise HTTPException(404, "Reporter not found")
     posts = await db.posts.find({"reporter_id": reporter_id}, {"_id": 0}).sort("created_at", -1).to_list(50)
-    return {"reporter": public_user(user) | {"beat": user.get("beat"), "location": user.get("location"), "followers": user.get("followers", 0)}, "posts": posts}
+    totals = await _support_totals([reporter_id])
+    followers = await _follower_count(reporter_id)
+    is_following = False
+    viewer = None
+    if credentials:
+        try:
+            claims = jwt.decode(credentials.credentials, jwt_secret(), algorithms=["HS256"])
+            viewer = claims.get("sub")
+            is_following = bool(await db.follows.find_one({"reporter_id": reporter_id, "supporter_id": viewer}))
+        except Exception:
+            viewer = None
+    return {
+        "reporter": public_user(user) | {
+            "beat": user.get("beat"),
+            "location": user.get("location"),
+            "followers": followers,
+            "support_total": totals.get(reporter_id, 0),
+            "is_following": is_following,
+        },
+        "posts": posts,
+    }
+
+
+@api_router.post("/reporters/{reporter_id}/follow")
+async def follow_reporter(reporter_id: str, user: dict = Depends(current_user)):
+    if user["id"] == reporter_id:
+        raise HTTPException(400, "You cannot follow yourself")
+    if not await db.users.find_one({"id": reporter_id, "role": "reporter"}):
+        raise HTTPException(404, "Reporter not found")
+    await db.follows.update_one(
+        {"reporter_id": reporter_id, "supporter_id": user["id"]},
+        {"$setOnInsert": {"reporter_id": reporter_id, "supporter_id": user["id"], "created_at": now()}},
+        upsert=True,
+    )
+    return {"ok": True, "following": True, "followers": await _follower_count(reporter_id)}
+
+
+@api_router.delete("/reporters/{reporter_id}/follow")
+async def unfollow_reporter(reporter_id: str, user: dict = Depends(current_user)):
+    await db.follows.delete_one({"reporter_id": reporter_id, "supporter_id": user["id"]})
+    return {"ok": True, "following": False, "followers": await _follower_count(reporter_id)}
 
 
 @api_router.post("/posts")
@@ -296,14 +371,57 @@ async def delete_post(post_id: str, user: dict = Depends(current_user)):
 async def create_upload(payload: UploadCreate, user: dict = Depends(require_roles("reporter", "admin"))):
     provider_required("MUX_TOKEN_ID", "MUX_TOKEN_SECRET")
     auth = (os.environ["MUX_TOKEN_ID"], os.environ["MUX_TOKEN_SECRET"])
-    body = {"cors_origin": os.getenv("APP_ORIGINS", "*").split(",")[0], "new_asset_settings": {"playback_policies": ["signed"], "passthrough": user["id"]}}
+    body = {
+        "cors_origin": "*",
+        "new_asset_settings": {"playback_policies": ["public"], "passthrough": user["id"]},
+    }
     async with httpx.AsyncClient(timeout=20) as http:
         response = await http.post("https://api.mux.com/video/v1/uploads", auth=auth, json=body)
     if response.status_code >= 400:
         raise HTTPException(502, "Mux could not create an upload URL")
     data = response.json()["data"]
-    await db.media.insert_one({"id": str(uuid.uuid4()), "owner_id": user["id"], "upload_id": data["id"], "filename": payload.filename, "content_type": payload.content_type, "status": "waiting", "created_at": now()})
+    await db.media.insert_one({
+        "id": str(uuid.uuid4()),
+        "owner_id": user["id"],
+        "upload_id": data["id"],
+        "filename": payload.filename,
+        "content_type": payload.content_type,
+        "status": "waiting",
+        "created_at": now(),
+    })
     return {"upload_url": data["url"], "upload_id": data["id"]}
+
+
+@api_router.get("/media/{upload_id}")
+async def media_status(upload_id: str, user: dict = Depends(current_user)):
+    """Poll Mux for the asset backing an upload_id and cache the playback_id.
+    Used by the frontend after a direct upload finishes when the webhook is not
+    wired in dev."""
+    provider_required("MUX_TOKEN_ID", "MUX_TOKEN_SECRET")
+    record = await db.media.find_one({"upload_id": upload_id}, {"_id": 0})
+    if not record:
+        raise HTTPException(404, "Upload not found")
+    if record.get("playback_id"):
+        return record
+    auth = (os.environ["MUX_TOKEN_ID"], os.environ["MUX_TOKEN_SECRET"])
+    async with httpx.AsyncClient(timeout=20) as http:
+        up_res = await http.get(f"https://api.mux.com/video/v1/uploads/{upload_id}", auth=auth)
+        if up_res.status_code >= 400:
+            raise HTTPException(502, "Mux could not read the upload status")
+        asset_id = (up_res.json().get("data") or {}).get("asset_id")
+        if not asset_id:
+            return record | {"status": "waiting"}
+        asset_res = await http.get(f"https://api.mux.com/video/v1/assets/{asset_id}", auth=auth)
+        if asset_res.status_code >= 400:
+            raise HTTPException(502, "Mux could not read the asset")
+        asset = asset_res.json().get("data", {})
+    playback_ids = asset.get("playback_ids") or []
+    playback_id = playback_ids[0]["id"] if playback_ids else None
+    await db.media.update_one(
+        {"upload_id": upload_id},
+        {"$set": {"status": asset.get("status", "processing"), "asset_id": asset_id, "playback_id": playback_id}},
+    )
+    return {**record, "status": asset.get("status", "processing"), "asset_id": asset_id, "playback_id": playback_id}
 
 
 @api_router.post("/webhooks/mux")
@@ -338,6 +456,21 @@ async def live_token(payload: LiveCreate, user: dict = Depends(require_roles("re
 @api_router.get("/live/sessions")
 async def live_sessions():
     return await db.live_sessions.find({"status": "live"}, {"_id": 0}).sort("started_at", -1).to_list(50)
+
+
+@api_router.post("/live/viewer-token")
+async def live_viewer_token(payload: dict, user: dict = Depends(current_user)):
+    provider_required("LIVEKIT_URL", "LIVEKIT_API_KEY", "LIVEKIT_API_SECRET")
+    room_name = payload.get("room")
+    if not room_name:
+        raise HTTPException(400, "room is required")
+    token = (
+        livekit_api.AccessToken(os.environ["LIVEKIT_API_KEY"], os.environ["LIVEKIT_API_SECRET"])
+        .with_identity(user["id"])
+        .with_name(user["name"])
+        .with_grants(livekit_api.VideoGrants(room_join=True, room=room_name, can_publish=False, can_subscribe=True))
+    )
+    return {"token": token.to_jwt(), "url": os.environ["LIVEKIT_URL"], "room": room_name}
 
 
 @api_router.post("/live/{session_id}/end")

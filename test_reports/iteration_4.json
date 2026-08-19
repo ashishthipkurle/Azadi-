@@ -1,0 +1,37 @@
+{
+  "summary": "Backend-only iteration for the 4 new/extended FreePress features. 39/39 pytest cases pass (26 regression + 13 new). Verified: POST /api/live/viewer-token requires auth (401), returns friendly 503 without LIVEKIT_* keys, and returns 400 on empty room (asserted conditionally on key presence). GET /api/media/{upload_id} requires auth (401) and returns 503 friendly without MUX keys (not 500). GET /api/reporters exposes support_total (int) and followers on every reporter with no _id leak. GET /api/reporters/{id} returns { reporter:{ support_total, followers, is_following }, posts:[] } — is_following false when unauthenticated / after unfollow, true after follow. POST /api/reporters/{id}/follow: 401 without token, 400 on self, 404 on unknown, idempotent (double-follow does not double the count) and returns { ok:true, following:true, followers:N }. DELETE decrements followers and flips is_following back to false. POST /api/posts accepts media=[{kind:'image', playback_id:'...'}] and the media list survives on /api/feed. Full previous regression suite (auth, feed, posts CRUD, provider-gated 503 for support/live/media, admin moderation and user disable/enable/verify) continues to pass.",
+  "backend_issues": {
+    "critical": [],
+    "minor": []
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": [],
+    "react_native_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/backend_test.py",
+    "/app/backend/tests/test_iter4_features.py",
+    "/app/test_reports/pytest/iteration_4_results.xml"
+  ],
+  "action_items": [],
+  "critical_code_review_comments": [
+    "server.py: /api/live/viewer-token accepts payload: dict (no Pydantic model). Fine, but a typed model would give cleaner 422s. Right now empty room after keys exist correctly returns 400.",
+    "server.py: /api/media/{upload_id} correctly runs provider_required before any DB lookup, so a missing MUX key yields 503 (not 500) even for unknown upload_ids. Good.",
+    "server.py: follow endpoint uses upsert with $setOnInsert — idempotency confirmed by tests. DELETE follow is also idempotent (returns following:false even if no doc existed) which is desirable.",
+    "server.py: _support_totals aggregates only status='verified' supports — as intended since Razorpay verify sets that status.",
+    "Still on deprecated @app.on_event('startup'/'shutdown'); migrating to FastAPI lifespan handlers is a non-blocking cleanup."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_iter4_features.py (new)",
+    "/app/test_reports/iteration_4.json",
+    "/app/test_reports/pytest/iteration_4_results.xml"
+  ],
+  "success_rate": {"backend": "100% (39/39 pytest tests)", "frontend": "not tested (backend-only scope)"},
+  "seed_data_creation": "TEST_ posts + one follow relationship (reader -> rhea) created and cleaned up within tests; follow relationship is torn down at end of TestFollow.test_follow_idempotent_then_unfollow. No orphan data expected.",
+  "retest_needed": false,
+  "should_main_agent_self_test": true,
+  "context_for_next_testing_agent": "Suite runs under EXPO_PUBLIC_BACKEND_URL. Regression file /app/backend/tests/backend_test.py, new feature file /app/backend/tests/test_iter4_features.py. LIVEKIT_*, MUX_*, RAZORPAY_* keys intentionally absent in dev → those endpoints return 503 with 'coming soon' — this is by design. If keys are later added, TestLiveViewerToken::test_viewer_token_empty_room_returns_400 auto-tightens to require 400 (rather than 400/503).",
+  "rca_of_issue": "N/A — no failures."
+}
