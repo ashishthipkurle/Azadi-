@@ -1,0 +1,35 @@
+{
+  "summary": "Backend-only regression on the new FreePress API (custom JWT + argon2 via pwdlib). 26/26 pytest cases pass against the public preview URL. All specified scenarios verified: register (client/reporter, 409 dup), login for seeded admin/reporter/reader plus 401 on wrong password, /auth/me 401 without token, public feed & reporters expose arrays with no _id leak, reporter can create + list + delete own posts (403 for reader, 403 across reporters, admin can delete any), provider-gated endpoints (/support, /live/token, /media/upload-url) return 503 with a friendly 'coming soon' message rather than 500, /reports creates moderation record, /reports/{id}/resolve enforces admin (403 for non-admin, 200 for admin) and returns 404 on second resolve, and admin routes (overview, users, disable/enable/verify) require admin role with admin unable to disable self (400). Disabled account login correctly returns 403.",
+  "backend_issues": {
+    "critical": [],
+    "minor": []
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": [],
+    "react_native_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/backend_test.py",
+    "/app/test_reports/pytest/iteration_3_results.xml"
+  ],
+  "action_items": [],
+  "critical_code_review_comments": [
+    "server.py uses @app.on_event startup/shutdown which is deprecated in FastAPI; consider migrating to lifespan handlers (non-blocking).",
+    "public_user() omits verified default correctly, and all response filters exclude _id — good.",
+    "provider_required() surfaces integration hints in the 503 detail; matches the 'coming soon' contract.",
+    "current_user() re-issues 401 when the DB user's role diverges from the token — good defensive check after admin role changes.",
+    "seed_data() is idempotent per-email; safe on repeated startups."
+  ],
+  "updated_files": [
+    "/app/backend/tests/backend_test.py (new pytest suite, replaced legacy test_public_api.py)",
+    "/app/test_reports/iteration_3.json"
+  ],
+  "success_rate": {"backend": "100% (26/26 pytest tests)", "frontend": "not tested (backend-only pass)"},
+  "seed_data_creation": "Ephemeral TEST_ users, posts, and moderation reports created via API during test run (prefixed TEST). No cleanup endpoint invoked; records remain but are isolated by TEST_ prefix.",
+  "retest_needed": false,
+  "should_main_agent_self_test": true,
+  "context_for_next_testing_agent": "Preview: https://reporter-hub-11.preview.emergentagent.com. Auth is JWT bearer via pwdlib argon2. Seeded users: admin@freepress.in/admin123, rhea@freepress.in/reporter123, reader@freepress.in/reader123. Provider integrations (Mux, LiveKit, Razorpay) intentionally return 503 'coming soon' until keys are added to backend/.env. Regression suite at /app/backend/tests/backend_test.py — run with EXPO_PUBLIC_BACKEND_URL set.",
+  "rca_of_issue": "N/A — no failures."
+}
