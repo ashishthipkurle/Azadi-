@@ -1,6 +1,6 @@
-// Reader / client home: dispatch wall with a live-now strip, ₹7 Razorpay
-// support, and a "flag for moderation" flow. Tapping a reporter byline opens
-// their profile page.
+// Reader / client home: dispatch wall with an All / Following tab switch,
+// live-now strip, inline Mux media, ₹7 Razorpay support (one-time or monthly),
+// and a "flag for moderation" flow.
 import { useRouter } from "expo-router";
 import { useCallback, useEffect, useState } from "react";
 import {
@@ -18,7 +18,9 @@ import { SafeAreaView } from "react-native-safe-area-context";
 
 import { apiGet, apiPost, ApiError } from "@/src/api";
 import { useAuth } from "@/src/auth";
+import { MediaPlayer, type MediaAttachment } from "@/src/media-player";
 import { RazorpayCheckout, type CheckoutOrder } from "@/src/razorpay";
+import { SupportChoiceSheet, type SupportInterval } from "@/src/support-choice";
 import { C } from "@/src/theme";
 import { Button, EmptyState, Icon, Toast } from "@/src/ui";
 
@@ -32,7 +34,7 @@ type Post = {
   kind: string;
   location: string;
   stats: string;
-  media?: { kind: string; playback_id?: string; url?: string }[];
+  media?: MediaAttachment[];
 };
 type Reporter = {
   id: string;
@@ -51,12 +53,14 @@ type LiveSession = {
   reporter_name: string;
 };
 
-const CATEGORIES = ["All dispatches", "Field report", "Photo essay", "Dispatch"];
+const CATEGORIES = ["All", "Field report", "Photo essay", "Dispatch"];
 
 export default function Feed() {
   const router = useRouter();
   const { user, logout } = useAuth();
-  const [posts, setPosts] = useState<Post[]>([]);
+  const [tab, setTab] = useState<"all" | "following">("all");
+  const [allPosts, setAllPosts] = useState<Post[]>([]);
+  const [followingPosts, setFollowingPosts] = useState<Post[]>([]);
   const [reporters, setReporters] = useState<Reporter[]>([]);
   const [liveSessions, setLiveSessions] = useState<LiveSession[]>([]);
   const [category, setCategory] = useState(0);
@@ -65,18 +69,21 @@ export default function Feed() {
   const [toast, setToast] = useState<{ message: string; tone: "success" | "error" | "info" } | null>(null);
   const [reporting, setReporting] = useState<Post | null>(null);
   const [reportReason, setReportReason] = useState("");
+  const [supportTarget, setSupportTarget] = useState<{ id: string; name: string } | null>(null);
   const [checkout, setCheckout] = useState<{ order: CheckoutOrder; reporterName: string } | null>(null);
 
   const load = useCallback(async () => {
     try {
-      const [p, r, live] = await Promise.all([
+      const [p, r, live, following] = await Promise.all([
         apiGet<Post[]>("/feed"),
         apiGet<Reporter[]>("/reporters"),
         apiGet<LiveSession[]>("/live/sessions"),
+        apiGet<Post[]>("/feed/following").catch(() => [] as Post[]),
       ]);
-      setPosts(p);
+      setAllPosts(p);
       setReporters(r);
       setLiveSessions(live);
+      setFollowingPosts(following);
     } catch {
       setToast({ message: "Could not load the dispatch wall.", tone: "error" });
     } finally {
@@ -94,13 +101,24 @@ export default function Feed() {
     setRefreshing(false);
   };
 
-  const startSupport = async (reporter: { id: string; name?: string }) => {
+  const openSupport = (reporter: { id: string; name?: string }) => {
+    setSupportTarget({ id: reporter.id, name: reporter.name || "this reporter" });
+  };
+
+  const startCheckout = async (interval: SupportInterval) => {
+    if (!supportTarget) return;
     try {
-      const order = await apiPost<CheckoutOrder>("/support", { reporter_id: reporter.id, amount: 7 });
-      setCheckout({ order, reporterName: reporter.name || "this reporter" });
+      const order = await apiPost<CheckoutOrder>("/support", {
+        reporter_id: supportTarget.id,
+        amount: 7,
+        interval,
+      });
+      setCheckout({ order, reporterName: supportTarget.name });
     } catch (e) {
       const message = e instanceof ApiError ? e.message : "Support could not be started.";
       setToast({ message, tone: e instanceof ApiError && e.status === 503 ? "info" : "error" });
+    } finally {
+      setSupportTarget(null);
     }
   };
 
@@ -119,8 +137,11 @@ export default function Feed() {
     }
   };
 
+  const sourcePosts = tab === "following" ? followingPosts : allPosts;
   const filtered =
-    category === 0 ? posts : posts.filter((p) => p.kind.toLowerCase() === CATEGORIES[category].toLowerCase());
+    category === 0
+      ? sourcePosts
+      : sourcePosts.filter((p) => p.kind.toLowerCase() === CATEGORIES[category].toLowerCase());
 
   return (
     <SafeAreaView style={styles.safe} edges={["top", "bottom"]}>
@@ -146,6 +167,21 @@ export default function Feed() {
           <Text style={styles.hello}>Hey {user?.name?.split(" ")[0] || "there"}.</Text>
           <Text style={styles.headline}>Today's ground truth.</Text>
 
+          <View style={styles.tabRow}>
+            {(["all", "following"] as const).map((t) => (
+              <Pressable
+                key={t}
+                testID={`feed-tab-${t}`}
+                onPress={() => setTab(t)}
+                style={[styles.tab, tab === t && styles.tabActive]}
+              >
+                <Text style={[styles.tabText, tab === t && styles.tabTextActive]}>
+                  {t === "all" ? "All" : `Following · ${followingPosts.length}`}
+                </Text>
+              </Pressable>
+            ))}
+          </View>
+
           {liveSessions.length ? (
             <View style={styles.liveStrip}>
               <View style={styles.liveStripHeader}>
@@ -157,7 +193,12 @@ export default function Feed() {
                   <Pressable
                     key={s.id}
                     testID={`live-tile-${s.room}`}
-                    onPress={() => router.push({ pathname: "/(reader)/live/[room]", params: { room: s.room, title: s.title, reporter: s.reporter_name } })}
+                    onPress={() =>
+                      router.push({
+                        pathname: "/(reader)/live/[room]",
+                        params: { room: s.room, title: s.title, reporter: s.reporter_name },
+                      })
+                    }
                     style={styles.liveTile}
                   >
                     <View style={styles.liveTilePill}>
@@ -186,7 +227,15 @@ export default function Feed() {
           </ScrollView>
 
           {filtered.length === 0 ? (
-            <EmptyState title="Nothing here yet." body="Check back soon — new dispatches drop throughout the day." icon="newspaper-outline" />
+            <EmptyState
+              title={tab === "following" ? "You're not following anyone yet." : "Nothing here yet."}
+              body={
+                tab === "following"
+                  ? "Tap a reporter's byline to open their profile and follow them."
+                  : "Check back soon — new dispatches drop throughout the day."
+              }
+              icon="newspaper-outline"
+            />
           ) : (
             filtered.map((post, i) => (
               <View key={post.id} testID="reader-feed-item" style={[styles.post, i === 0 && styles.leadPost]}>
@@ -198,14 +247,15 @@ export default function Feed() {
                 </View>
                 <Text style={[styles.postTitle, i === 0 && styles.leadTitle]}>{post.title}</Text>
                 <Text style={[styles.postBody, i === 0 && styles.leadBody]}>{post.body}</Text>
+
                 {post.media?.length ? (
-                  <View style={styles.mediaHint}>
-                    <Icon name="images-outline" color={i === 0 ? C.surface : C.muted} size={14} />
-                    <Text style={[styles.mediaHintText, i === 0 && { color: C.surface }]}>
-                      {post.media.length} attachment{post.media.length > 1 ? "s" : ""}
-                    </Text>
+                  <View style={styles.mediaStack}>
+                    {post.media.map((m, idx) => (
+                      <MediaPlayer key={`${post.id}-${idx}`} media={m} />
+                    ))}
                   </View>
                 ) : null}
+
                 <View style={styles.postFooter}>
                   <Pressable
                     testID={`reader-open-reporter-${post.reporter_id}`}
@@ -223,12 +273,7 @@ export default function Feed() {
                 <View style={[styles.actions, i === 0 && { borderTopColor: "#2E353D" }]}>
                   <Pressable
                     testID="reader-support-button"
-                    onPress={() =>
-                      startSupport({
-                        id: post.reporter_id,
-                        name: post.reporter_name,
-                      })
-                    }
+                    onPress={() => openSupport({ id: post.reporter_id, name: post.reporter_name })}
                     style={styles.action}
                   >
                     <Icon name="heart-outline" color={i === 0 ? C.surface : C.red} size={18} />
@@ -277,7 +322,7 @@ export default function Feed() {
                     testID="support-seven-rupees-button"
                     onPress={(e) => {
                       e.stopPropagation?.();
-                      startSupport(r);
+                      openSupport(r);
                     }}
                     style={styles.supportSmall}
                   >
@@ -320,6 +365,13 @@ export default function Feed() {
         </View>
       </Modal>
 
+      <SupportChoiceSheet
+        visible={!!supportTarget}
+        reporterName={supportTarget?.name || ""}
+        onDismiss={() => setSupportTarget(null)}
+        onChoose={startCheckout}
+      />
+
       <RazorpayCheckout
         visible={!!checkout}
         order={checkout?.order || null}
@@ -356,7 +408,12 @@ const styles = StyleSheet.create({
   avatar: { backgroundColor: C.ink, borderRadius: 20, width: 40, height: 40, alignItems: "center", justifyContent: "center" },
   content: { padding: 20, paddingBottom: 60 },
   hello: { color: C.muted, fontSize: 13, fontWeight: "700" },
-  headline: { color: C.ink, fontSize: 32, fontWeight: "800", letterSpacing: -1, marginTop: 4, marginBottom: 20 },
+  headline: { color: C.ink, fontSize: 32, fontWeight: "800", letterSpacing: -1, marginTop: 4, marginBottom: 16 },
+  tabRow: { flexDirection: "row", backgroundColor: C.line, padding: 3, borderRadius: 8, marginBottom: 18 },
+  tab: { flex: 1, alignItems: "center", paddingVertical: 10, borderRadius: 6 },
+  tabActive: { backgroundColor: C.surface },
+  tabText: { color: C.muted, fontWeight: "800", fontSize: 12 },
+  tabTextActive: { color: C.ink },
   liveStrip: { marginBottom: 20 },
   liveStripHeader: { flexDirection: "row", gap: 6, alignItems: "center", marginBottom: 10 },
   liveStripLabel: { color: C.red, fontSize: 10, fontWeight: "800", letterSpacing: 1.5 },
@@ -412,8 +469,7 @@ const styles = StyleSheet.create({
   leadTitle: { color: C.surface, fontSize: 28, lineHeight: 30 },
   postBody: { color: C.muted, fontSize: 15, lineHeight: 22, marginTop: 10 },
   leadBody: { color: "#B7BEC5" },
-  mediaHint: { flexDirection: "row", alignItems: "center", gap: 6, marginTop: 10 },
-  mediaHintText: { color: C.muted, fontSize: 11, fontWeight: "700" },
+  mediaStack: { gap: 10, marginTop: 14 },
   postFooter: { flexDirection: "row", justifyContent: "space-between", marginTop: 18, alignItems: "center" },
   byline: { color: C.ink, fontSize: 13, fontWeight: "700" },
   meta: { color: C.muted, fontSize: 12 },

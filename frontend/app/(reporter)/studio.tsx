@@ -26,6 +26,7 @@ import { apiDelete, apiGet, apiPost, ApiError } from "@/src/api";
 import { useAuth } from "@/src/auth";
 import { LiveStage } from "@/src/live-stage";
 import { publishLive, type LiveConnection } from "@/src/livekit";
+import { MediaPlayer, type MediaAttachment } from "@/src/media-player";
 import { uploadToMux } from "@/src/mux";
 import { C } from "@/src/theme";
 import { Button, EmptyState, Icon, Toast } from "@/src/ui";
@@ -37,7 +38,16 @@ type MyPost = {
   kind: string;
   created_at: string;
   verified: boolean;
-  media?: { kind: string; playback_id?: string; url?: string }[];
+  media?: MediaAttachment[];
+};
+
+type Earnings = {
+  lifetime: number;
+  verified_count: number;
+  pending_amount: number;
+  pending_count: number;
+  monthly_pledges: number;
+  top_supporters: { supporter_id: string; name: string; total: number; count: number }[];
 };
 
 type Attachment = {
@@ -49,7 +59,7 @@ type Attachment = {
 
 export default function Studio() {
   const { user, logout } = useAuth();
-  const [mode, setMode] = useState<"story" | "live">("story");
+  const [mode, setMode] = useState<"story" | "live" | "earnings">("story");
   const [title, setTitle] = useState("");
   const [body, setBody] = useState("");
   const [kind, setKind] = useState<"field report" | "photo essay" | "dispatch">("dispatch");
@@ -58,6 +68,7 @@ export default function Studio() {
   const [sessionMeta, setSessionMeta] = useState<{ room: string } | null>(null);
   const [localVideoTrack, setLocalVideoTrack] = useState<any>(null);
   const [posts, setPosts] = useState<MyPost[]>([]);
+  const [earnings, setEarnings] = useState<Earnings | null>(null);
   const [refreshing, setRefreshing] = useState(false);
   const [busy, setBusy] = useState(false);
   const [toast, setToast] = useState<{ message: string; tone: "success" | "error" | "info" } | null>(null);
@@ -72,9 +83,19 @@ export default function Studio() {
     }
   }, []);
 
+  const loadEarnings = useCallback(async () => {
+    try {
+      const e = await apiGet<Earnings>("/reporter/earnings");
+      setEarnings(e);
+    } catch {
+      /* silent — earnings tab shows its own empty state */
+    }
+  }, []);
+
   useEffect(() => {
     loadPosts();
-  }, [loadPosts]);
+    loadEarnings();
+  }, [loadPosts, loadEarnings]);
 
   // Clean up any live connection when the studio unmounts.
   useEffect(() => {
@@ -270,15 +291,18 @@ export default function Studio() {
           </View>
 
           <View style={styles.segment}>
-            {(["story", "live"] as const).map((m) => (
+            {(["story", "live", "earnings"] as const).map((m) => (
               <Pressable
                 key={m}
                 testID={`reporter-mode-${m}`}
-                onPress={() => setMode(m)}
+                onPress={() => {
+                  setMode(m);
+                  if (m === "earnings") loadEarnings();
+                }}
                 style={[styles.segmentItem, mode === m && styles.segmentActive]}
               >
                 <Text style={[styles.segmentText, mode === m && styles.segmentTextActive]}>
-                  {m === "story" ? "Write" : "Go live"}
+                  {m === "story" ? "Write" : m === "live" ? "Go live" : "Earnings"}
                 </Text>
               </Pressable>
             ))}
@@ -364,7 +388,11 @@ export default function Studio() {
                       <Text style={styles.postRowKind}>{p.kind.toUpperCase()}</Text>
                       <Text style={styles.postRowTitle} numberOfLines={2}>{p.title}</Text>
                       {p.media?.length ? (
-                        <Text style={styles.postRowMeta}>{p.media.length} attachment{p.media.length > 1 ? "s" : ""}</Text>
+                        <View style={{ marginTop: 10, gap: 8 }}>
+                          {p.media.map((m, idx) => (
+                            <MediaPlayer key={`${p.id}-m-${idx}`} media={m} radius={4} />
+                          ))}
+                        </View>
                       ) : null}
                     </View>
                     <Pressable testID={`reporter-delete-${p.id}`} onPress={() => deletePost(p.id)} style={styles.iconBtn}>
@@ -374,7 +402,7 @@ export default function Studio() {
                 ))
               )}
             </>
-          ) : (
+          ) : mode === "live" ? (
             <>
               <Text style={styles.title}>Go live, stay connected.</Text>
 
@@ -420,12 +448,60 @@ export default function Studio() {
                 </>
               )}
             </>
+          ) : (
+            <>
+              <Text style={styles.title}>Your support wall.</Text>
+              <View style={styles.earningsGrid}>
+                <EarningTile label="LIFETIME ₹" value={earnings?.lifetime ?? "—"} tone={C.green} />
+                <EarningTile label="SUPPORTERS" value={earnings?.verified_count ?? "—"} />
+                <EarningTile label="MONTHLY PLEDGES" value={earnings?.monthly_pledges ?? "—"} tone={C.red} />
+                <EarningTile label="PENDING ₹" value={earnings?.pending_amount ?? "—"} />
+              </View>
+
+              <Text style={[styles.overline, { marginTop: 22, marginBottom: 10 }]}>TOP SUPPORTERS</Text>
+              {earnings?.top_supporters?.length ? (
+                earnings.top_supporters.map((s, idx) => (
+                  <View key={s.supporter_id} style={styles.supporterRow}>
+                    <View style={styles.supporterRank}>
+                      <Text style={styles.supporterRankText}>{idx + 1}</Text>
+                    </View>
+                    <View style={{ flex: 1 }}>
+                      <Text style={styles.supporterName}>{s.name}</Text>
+                      <Text style={styles.postRowMeta}>{s.count} payment{s.count > 1 ? "s" : ""}</Text>
+                    </View>
+                    <Text style={styles.supporterTotal}>₹{s.total}</Text>
+                  </View>
+                ))
+              ) : (
+                <EmptyState
+                  title="No supporters yet."
+                  body="Once readers back you, you'll see them ranked here — and every ₹7 rolls up to your lifetime total."
+                  icon="heart-outline"
+                />
+              )}
+
+              <View style={styles.notice}>
+                <Icon name="information-circle-outline" color={C.blue} size={17} />
+                <Text style={styles.noticeText}>
+                  Payouts run automatically through Razorpay once you add your bank details. Verified support totals update the moment a payment clears.
+                </Text>
+              </View>
+            </>
           )}
         </ScrollView>
       </KeyboardAvoidingView>
 
       {toast ? <Toast message={toast.message} tone={toast.tone} onDismiss={() => setToast(null)} /> : null}
     </SafeAreaView>
+  );
+}
+
+function EarningTile({ label, value, tone }: { label: string; value: number | string; tone?: string }) {
+  return (
+    <View style={styles.earningTile}>
+      <Text style={[styles.earningValue, tone ? { color: tone } : null]}>{value}</Text>
+      <Text style={styles.earningLabel}>{label}</Text>
+    </View>
   );
 }
 
@@ -564,4 +640,43 @@ const styles = StyleSheet.create({
   previewText: { color: C.surface, fontWeight: "800", fontSize: 17 },
   previewSub: { color: "#B7BEC5", fontSize: 12, textAlign: "center", lineHeight: 18 },
   helperText: { color: C.muted, fontSize: 12, marginTop: 12, marginBottom: 8, lineHeight: 18 },
+  earningsGrid: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: 10,
+    marginBottom: 8,
+  },
+  earningTile: {
+    flexGrow: 1,
+    flexBasis: "45%",
+    backgroundColor: C.surface,
+    borderWidth: 1,
+    borderColor: C.line,
+    padding: 14,
+    borderRadius: 6,
+  },
+  earningValue: { color: C.ink, fontSize: 24, fontWeight: "800", letterSpacing: -0.5 },
+  earningLabel: { color: C.muted, fontSize: 10, letterSpacing: 1, marginTop: 6, fontWeight: "800" },
+  supporterRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 12,
+    backgroundColor: C.surface,
+    borderWidth: 1,
+    borderColor: C.line,
+    padding: 12,
+    borderRadius: 6,
+    marginBottom: 8,
+  },
+  supporterRank: {
+    width: 32,
+    height: 32,
+    borderRadius: 16,
+    backgroundColor: C.paper,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  supporterRankText: { color: C.ink, fontWeight: "800", fontSize: 13 },
+  supporterName: { color: C.ink, fontWeight: "800", fontSize: 14 },
+  supporterTotal: { color: C.green, fontSize: 15, fontWeight: "800" },
 });

@@ -15,7 +15,9 @@ import { SafeAreaView } from "react-native-safe-area-context";
 
 import { apiDelete, apiGet, apiPost, ApiError } from "@/src/api";
 import { useAuth } from "@/src/auth";
+import { MediaPlayer, type MediaAttachment } from "@/src/media-player";
 import { RazorpayCheckout, type CheckoutOrder } from "@/src/razorpay";
+import { SupportChoiceSheet, type SupportInterval } from "@/src/support-choice";
 import { C } from "@/src/theme";
 import { Button, EmptyState, Icon, Toast } from "@/src/ui";
 
@@ -40,7 +42,7 @@ type ProfileResp = {
     location: string;
     stats: string;
     created_at: string;
-    media?: { kind: string; playback_id?: string }[];
+    media?: MediaAttachment[];
   }[];
 };
 
@@ -53,6 +55,7 @@ export default function ReporterProfile() {
   const [loading, setLoading] = useState(true);
   const [toast, setToast] = useState<{ message: string; tone: "success" | "error" | "info" } | null>(null);
   const [checkout, setCheckout] = useState<CheckoutOrder | null>(null);
+  const [choosingInterval, setChoosingInterval] = useState(false);
 
   const load = useCallback(async () => {
     try {
@@ -87,10 +90,15 @@ export default function ReporterProfile() {
     }
   };
 
-  const startSupport = async () => {
+  const startSupport = async (interval: SupportInterval) => {
     if (!data) return;
+    setChoosingInterval(false);
     try {
-      const order = await apiPost<CheckoutOrder>("/support", { reporter_id: data.reporter.id, amount: 7 });
+      const order = await apiPost<CheckoutOrder>("/support", {
+        reporter_id: data.reporter.id,
+        amount: 7,
+        interval,
+      });
       setCheckout(order);
     } catch (e) {
       const message = e instanceof ApiError ? e.message : "Support could not be started.";
@@ -171,7 +179,7 @@ export default function ReporterProfile() {
                   {r.is_following ? "Following" : "Follow"}
                 </Text>
               </Pressable>
-              <Pressable testID="profile-support-button" onPress={startSupport} style={styles.supportBtn}>
+              <Pressable testID="profile-support-button" onPress={() => setChoosingInterval(true)} style={styles.supportBtn}>
                 <Icon name="heart" color={C.surface} size={17} />
                 <Text style={styles.supportBtnText}>Support ₹7</Text>
               </Pressable>
@@ -192,19 +200,27 @@ export default function ReporterProfile() {
               <Text style={styles.postKind}>{p.kind.toUpperCase()}</Text>
               <Text style={styles.postTitle}>{p.title}</Text>
               <Text style={styles.postBody} numberOfLines={3}>{p.body}</Text>
+              {p.media?.length ? (
+                <View style={{ gap: 10, marginTop: 12 }}>
+                  {p.media.map((m, idx) => (
+                    <MediaPlayer key={`${p.id}-${idx}`} media={m} />
+                  ))}
+                </View>
+              ) : null}
               <View style={styles.postFooter}>
                 <Text style={styles.meta}>{p.location}</Text>
-                {p.media?.length ? (
-                  <View style={styles.mediaHint}>
-                    <Icon name="images-outline" color={C.muted} size={13} />
-                    <Text style={styles.mediaHintText}>{p.media.length} attachment{p.media.length > 1 ? "s" : ""}</Text>
-                  </View>
-                ) : null}
               </View>
             </View>
           ))
         )}
       </ScrollView>
+
+      <SupportChoiceSheet
+        visible={choosingInterval}
+        reporterName={r.name}
+        onDismiss={() => setChoosingInterval(false)}
+        onChoose={startSupport}
+      />
 
       <RazorpayCheckout
         visible={!!checkout}

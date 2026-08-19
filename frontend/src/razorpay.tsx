@@ -19,7 +19,9 @@ import { C } from "@/src/theme";
 import { Icon } from "@/src/ui";
 
 export type CheckoutOrder = {
-  order_id: string;
+  interval?: "once" | "monthly";
+  order_id?: string;
+  subscription_id?: string;
   key_id: string;
   amount: number;
   currency: string;
@@ -38,6 +40,11 @@ type Props = {
 function buildHtml(order: CheckoutOrder, name: string, email: string, reporter: string) {
   // Inline HTML shell that boots Razorpay Standard Checkout.
   // Uses window.ReactNativeWebView.postMessage to talk back to the app.
+  const isMonthly = order.interval === "monthly";
+  const orderField = isMonthly
+    ? `subscription_id: ${JSON.stringify(order.subscription_id)}`
+    : `order_id: ${JSON.stringify(order.order_id)}`;
+  const description = isMonthly ? `Monthly ₹7 pledge · ${reporter}` : `Support ${reporter} · ₹7`;
   return `<!doctype html>
 <html><head><meta name="viewport" content="width=device-width,initial-scale=1"><style>
   html,body{margin:0;padding:0;height:100%;background:#F4F0E8;font-family:-apple-system,system-ui,Roboto,sans-serif;color:#18202A}
@@ -48,8 +55,8 @@ function buildHtml(order: CheckoutOrder, name: string, email: string, reporter: 
 </style></head><body>
 <div class="wrap">
   <h1>Support ${reporter}</h1>
-  <p>Complete your ₹7 payment securely with Razorpay.</p>
-  <button id="pay">Pay ₹${(order.amount / 100).toFixed(0)}</button>
+  <p>${isMonthly ? "Set up your monthly ₹7 pledge with Razorpay." : "Complete your ₹7 payment securely with Razorpay."}</p>
+  <button id="pay">${isMonthly ? "Start ₹7/month" : "Pay ₹7"}</button>
 </div>
 <script src="https://checkout.razorpay.com/v1/checkout.js"></script>
 <script>
@@ -58,11 +65,10 @@ function buildHtml(order: CheckoutOrder, name: string, email: string, reporter: 
   }
   var opts = {
     key: ${JSON.stringify(order.key_id)},
-    amount: ${JSON.stringify(order.amount)},
-    currency: ${JSON.stringify(order.currency)},
+    ${!isMonthly ? `amount: ${JSON.stringify(order.amount)}, currency: ${JSON.stringify(order.currency)},` : ""}
     name: "FreePress",
-    description: "Support " + ${JSON.stringify(reporter)},
-    order_id: ${JSON.stringify(order.order_id)},
+    description: ${JSON.stringify(description)},
+    ${orderField},
     prefill: { name: ${JSON.stringify(name)}, email: ${JSON.stringify(email)} },
     theme: { color: "#18202A" },
     handler: function(response){ tell({ type: "success", payload: response }); },
@@ -102,10 +108,17 @@ export function RazorpayCheckout({ visible, order, reporterName, userName, userE
       try {
         await apiPost("/support/verify", {
           razorpay_order_id: msg.payload.razorpay_order_id,
+          razorpay_subscription_id: msg.payload.razorpay_subscription_id,
           razorpay_payment_id: msg.payload.razorpay_payment_id,
           razorpay_signature: msg.payload.razorpay_signature,
         });
-        onResult({ ok: true, message: `Thanks! ₹7 is on the way to ${reporterName}.` });
+        const isMonthly = order?.interval === "monthly";
+        onResult({
+          ok: true,
+          message: isMonthly
+            ? `Your monthly ₹7 pledge to ${reporterName} is active.`
+            : `Thanks! ₹7 is on the way to ${reporterName}.`,
+        });
       } catch (e) {
         const message = e instanceof ApiError ? e.message : "Payment could not be verified.";
         onResult({ ok: false, message });

@@ -91,6 +91,7 @@ class PostCreate(BaseModel):
 class SupportCreate(BaseModel):
     reporter_id: str
     amount: int = 7
+    interval: str = "once"  # "once" | "monthly"
 
 
 class ReportCreate(BaseModel):
@@ -244,6 +245,15 @@ async def feed():
     return await db.posts.find({}, {"_id": 0}).sort("created_at", -1).to_list(50)
 
 
+@api_router.get("/feed/following")
+async def feed_following(user: dict = Depends(current_user)):
+    follows = await db.follows.find({"supporter_id": user["id"]}, {"_id": 0, "reporter_id": 1}).to_list(500)
+    ids = [row["reporter_id"] for row in follows]
+    if not ids:
+        return []
+    return await db.posts.find({"reporter_id": {"$in": ids}}, {"_id": 0}).sort("created_at", -1).to_list(100)
+
+
 async def _support_totals(reporter_ids: list[str]) -> dict[str, int]:
     if not reporter_ids:
         return {}
@@ -354,6 +364,59 @@ async def create_post(payload: PostCreate, user: dict = Depends(require_roles("r
 @api_router.get("/posts/mine")
 async def my_posts(user: dict = Depends(require_roles("reporter", "admin"))):
     return await db.posts.find({"reporter_id": user["id"]}, {"_id": 0}).sort("created_at", -1).to_list(100)
+
+
+@api_router.get("/reporter/earnings")
+async def reporter_earnings(user: dict = Depends(require_roles("reporter", "admin"))):
+    """Lifetime earnings breakdown for the signed-in reporter."""
+    reporter_id = user["id"]
+    # Lifetime verified totals
+    lifetime = 0
+    verified_count = 0
+    async for row in db.supports.aggregate([
+        {"$match": {"reporter_id": reporter_id, "status": "verified"}},
+        {"$group": {"_id": None, "total": {"$sum": "$amount"}, "count": {"$sum": 1}}},
+    ]):
+        lifetime = row["total"]
+        verified_count = row["count"]
+    # Pending / created (not yet captured)
+    pending_amount = 0
+    pending_count = 0
+    async for row in db.supports.aggregate([
+        {"$match": {"reporter_id": reporter_id, "status": {"$in": ["created", "pending"]}}},
+        {"$group": {"_id": None, "total": {"$sum": "$amount"}, "count": {"$sum": 1}}},
+    ]):
+        pending_amount = row["total"]
+        pending_count = row["count"]
+    # Active monthly pledges
+    monthly_pledges = await db.supports.count_documents({
+        "reporter_id": reporter_id,
+        "interval": "monthly",
+        "status": {"$in": ["verified", "pending"]},
+    })
+    # Top supporters
+    top_supporters: list[dict] = []
+    async for row in db.supports.aggregate([
+        {"$match": {"reporter_id": reporter_id, "status": "verified"}},
+        {"$group": {"_id": "$supporter_id", "total": {"$sum": "$amount"}, "count": {"$sum": 1}}},
+        {"$sort": {"total": -1}},
+        {"$limit": 5},
+    ]):
+        supporter = await db.users.find_one({"id": row["_id"]}, {"_id": 0, "name": 1})
+        top_supporters.append({
+            "supporter_id": row["_id"],
+            "name": supporter["name"] if supporter else "Anonymous reader",
+            "total": row["total"],
+            "count": row["count"],
+        })
+    return {
+        "lifetime": lifetime,
+        "verified_count": verified_count,
+        "pending_amount": pending_amount,
+        "pending_count": pending_count,
+        "monthly_pledges": monthly_pledges,
+        "top_supporters": top_supporters,
+    }
 
 
 @api_router.delete("/posts/{post_id}")
@@ -488,28 +551,98 @@ async def end_live(session_id: str, user: dict = Depends(current_user)):
 async def support_reporter(payload: SupportCreate, user: dict = Depends(require_roles("client"))):
     if payload.amount != 7:
         raise HTTPException(400, "Support amount must be ₹7")
+    if payload.interval not in {"once", "monthly"}:
+        raise HTTPException(400, "interval must be 'once' or 'monthly'")
     provider_required("RAZORPAY_KEY_ID", "RAZORPAY_KEY_SECRET")
     gateway = razorpay.Client(auth=(os.environ["RAZORPAY_KEY_ID"], os.environ["RAZORPAY_KEY_SECRET"]))
-    order = gateway.order.create({"amount": 700, "currency": "INR", "receipt": f"support-{uuid.uuid4().hex[:16]}", "notes": {"supporter_id": user["id"], "reporter_id": payload.reporter_id}})
-    await db.supports.insert_one({"id": str(uuid.uuid4()), "supporter_id": user["id"], "reporter_id": payload.reporter_id, "amount": 7, "order_id": order["id"], "status": "created", "created_at": now()})
-    return {"order_id": order["id"], "amount": 700, "currency": "INR", "key_id": os.environ["RAZORPAY_KEY_ID"]}
+    if payload.interval == "monthly":
+        plan_id = os.getenv("RAZORPAY_MONTHLY_PLAN_ID")
+        if not plan_id:
+            raise HTTPException(
+                503,
+                "Monthly support is coming soon — add RAZORPAY_MONTHLY_PLAN_ID (a ₹7 monthly plan created in Razorpay) to backend/.env",
+            )
+        subscription = gateway.subscription.create({
+            "plan_id": plan_id,
+            "total_count": 24,  # 2 years by default
+            "customer_notify": 1,
+            "notes": {"supporter_id": user["id"], "reporter_id": payload.reporter_id},
+        })
+        await db.supports.insert_one({
+            "id": str(uuid.uuid4()),
+            "supporter_id": user["id"],
+            "reporter_id": payload.reporter_id,
+            "amount": 7,
+            "interval": "monthly",
+            "subscription_id": subscription["id"],
+            "status": "pending",
+            "created_at": now(),
+        })
+        return {
+            "interval": "monthly",
+            "subscription_id": subscription["id"],
+            "amount": 700,
+            "currency": "INR",
+            "key_id": os.environ["RAZORPAY_KEY_ID"],
+        }
+    order = gateway.order.create({
+        "amount": 700,
+        "currency": "INR",
+        "receipt": f"support-{uuid.uuid4().hex[:16]}",
+        "notes": {"supporter_id": user["id"], "reporter_id": payload.reporter_id},
+    })
+    await db.supports.insert_one({
+        "id": str(uuid.uuid4()),
+        "supporter_id": user["id"],
+        "reporter_id": payload.reporter_id,
+        "amount": 7,
+        "interval": "once",
+        "order_id": order["id"],
+        "status": "created",
+        "created_at": now(),
+    })
+    return {
+        "interval": "once",
+        "order_id": order["id"],
+        "amount": 700,
+        "currency": "INR",
+        "key_id": os.environ["RAZORPAY_KEY_ID"],
+    }
 
 
 @api_router.post("/support/verify")
 async def verify_support(payload: dict, user: dict = Depends(require_roles("client"))):
     provider_required("RAZORPAY_KEY_ID", "RAZORPAY_KEY_SECRET")
+    payment_id = payload.get("razorpay_payment_id")
+    signature = payload.get("razorpay_signature")
+    subscription_id = payload.get("razorpay_subscription_id")
+    order_id = payload.get("razorpay_order_id")
+    if not payment_id or not signature or (not subscription_id and not order_id):
+        raise HTTPException(400, "Missing payment identifiers")
     gateway = razorpay.Client(auth=(os.environ["RAZORPAY_KEY_ID"], os.environ["RAZORPAY_KEY_SECRET"]))
     try:
-        gateway.utility.verify_payment_signature({
-            "razorpay_order_id": payload["razorpay_order_id"],
-            "razorpay_payment_id": payload["razorpay_payment_id"],
-            "razorpay_signature": payload["razorpay_signature"],
-        })
+        if subscription_id:
+            gateway.utility.verify_payment_signature({
+                "razorpay_subscription_id": subscription_id,
+                "razorpay_payment_id": payment_id,
+                "razorpay_signature": signature,
+            })
+        else:
+            gateway.utility.verify_payment_signature({
+                "razorpay_order_id": order_id,
+                "razorpay_payment_id": payment_id,
+                "razorpay_signature": signature,
+            })
     except Exception:
         raise HTTPException(400, "Invalid payment signature")
+    query = (
+        {"subscription_id": subscription_id, "supporter_id": user["id"]}
+        if subscription_id
+        else {"order_id": order_id, "supporter_id": user["id"]}
+    )
     await db.supports.update_one(
-        {"order_id": payload["razorpay_order_id"], "supporter_id": user["id"]},
-        {"$set": {"payment_id": payload["razorpay_payment_id"], "status": "verified", "verified_at": now()}},
+        query,
+        {"$set": {"payment_id": payment_id, "status": "verified", "verified_at": now()}},
     )
     return {"ok": True, "status": "verified"}
 

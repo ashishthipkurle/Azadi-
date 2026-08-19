@@ -1,0 +1,38 @@
+{
+  "summary": "Backend-only iteration for the 4 new/extended FreePress iteration-5 features. 52/52 pytest cases pass (39 regression + 13 new). Verified: GET /api/feed/following requires auth (401), returns [] before follow, and returns only the followed reporter's posts after POST /api/reporters/{id}/follow (all entries scoped to reporter_id, no _id leak). GET /api/reporter/earnings requires auth (401), rejects clients with 403, and for a reporter with no verified supports returns { lifetime:0, verified_count:0, pending_amount:0, pending_count:0, monthly_pledges:0, top_supporters:[] } with all correct types. POST /api/support with interval='monthly' returns 503 with 'coming soon' (outer RAZORPAY_KEY_ID guard fires first in dev — test is env-aware and would assert on 'RAZORPAY_MONTHLY_PLAN_ID' text if keys were configured). POST /api/support with interval='once' returns 503 friendly (existing gate). POST /api/support with interval='weekly' returns 400 mentioning interval. POST /api/support with amount != 7 returns 400 for both once and monthly. POST /api/support/verify with razorpay_subscription_id returns 503 in dev without Razorpay keys. Regression suite (auth, feed, posts CRUD, provider-gated 503 for support/live/media, admin moderation, follow idempotency, reporter shape with support_total, live viewer-token, media status) continues to pass.",
+  "backend_issues": {
+    "critical": [],
+    "minor": []
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": [],
+    "react_native_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/backend_test.py",
+    "/app/backend/tests/test_iter4_features.py",
+    "/app/backend/tests/test_iter5_features.py",
+    "/app/test_reports/pytest/iteration_5_results.xml"
+  ],
+  "action_items": [],
+  "critical_code_review_comments": [
+    "server.py /api/support monthly branch: outer provider_required('RAZORPAY_KEY_ID','RAZORPAY_KEY_SECRET') runs before the RAZORPAY_MONTHLY_PLAN_ID check. In dev (no Razorpay keys) callers see the generic 'coming soon' 503 rather than the plan-id-specific hint. This is fine because it fails-fast on the missing gateway, but the plan-id-specific message will only surface once keys are added. Test is env-conditional to accept either.",
+    "server.py /api/reporter/earnings correctly uses require_roles('reporter','admin'). Admins hitting the endpoint get zero results for themselves (no supports targeted at admin id) — acceptable but worth documenting.",
+    "server.py /api/feed/following returns [] short-circuit before the DB $in query — good defensive pattern.",
+    "server.py /api/support/verify: subscription-id branch requires payload keys razorpay_payment_id + razorpay_signature; missing keys would surface as KeyError → 500. In dev the provider_required guard short-circuits with 503 so this isn't hit, but adding a Pydantic model or explicit .get with 400 would harden it once Razorpay keys are configured.",
+    "Still on deprecated @app.on_event('startup'/'shutdown'); migrating to FastAPI lifespan handlers is a non-blocking cleanup."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_iter5_features.py (new)",
+    "/app/test_reports/iteration_5.json",
+    "/app/test_reports/pytest/iteration_5_results.xml"
+  ],
+  "success_rate": {"backend": "100% (52/52 pytest tests)", "frontend": "not tested (backend-only scope)"},
+  "seed_data_creation": "TEST_ post + one follow relationship (reader -> rhea) created and cleaned up within TestFollowingFeed.test_following_feed_returns_posts_after_follow (try/finally). No orphan data expected.",
+  "retest_needed": false,
+  "should_main_agent_self_test": true,
+  "context_for_next_testing_agent": "Suite runs under EXPO_PUBLIC_BACKEND_URL (must be exported to env before pytest). Files: /app/backend/tests/backend_test.py (regression), /app/backend/tests/test_iter4_features.py, /app/backend/tests/test_iter5_features.py. LIVEKIT_*, MUX_*, RAZORPAY_* keys intentionally absent in dev → those endpoints return 503 with 'coming soon' by design. Tests are env-conditional: if RAZORPAY_KEY_ID/SECRET are later added, TestSupportInterval::test_support_monthly_returns_503_mentioning_plan_id auto-tightens to require the 'RAZORPAY_MONTHLY_PLAN_ID' hint in the detail. Command: `EXPO_PUBLIC_BACKEND_URL=$EXPO_PUBLIC_BACKEND_URL python -m pytest /app/backend/tests/ -v`.",
+  "rca_of_issue": "N/A — no failures."
+}
