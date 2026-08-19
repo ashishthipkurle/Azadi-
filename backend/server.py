@@ -114,8 +114,39 @@ class BookmarkCreate(BaseModel):
     post_id: str
 
 
+class CommentCreate(BaseModel):
+    body: str = Field(min_length=1, max_length=1200)
+    parent_id: Optional[str] = None
+
+
 def public_user(user: dict) -> dict:
     return {"id": user["id"], "name": user["name"], "email": user["email"], "role": user["role"], "verified": user.get("verified", False)}
+
+
+async def notify(
+    recipient_id: str,
+    kind: str,
+    actor: dict,
+    message: str,
+    subject_id: Optional[str] = None,
+    subject_kind: Optional[str] = None,
+):
+    """Insert a single notification row. Silently no-ops if the caller is the
+    recipient (people don't need to be pinged about their own actions)."""
+    if recipient_id == actor.get("id"):
+        return
+    await db.notifications.insert_one({
+        "id": str(uuid.uuid4()),
+        "recipient_id": recipient_id,
+        "kind": kind,
+        "actor_id": actor.get("id"),
+        "actor_name": actor.get("name"),
+        "subject_id": subject_id,
+        "subject_kind": subject_kind,
+        "message": message,
+        "read": False,
+        "created_at": now(),
+    })
 
 
 def token_for(user: dict) -> str:
@@ -421,11 +452,20 @@ async def follow_reporter(reporter_id: str, user: dict = Depends(current_user)):
         raise HTTPException(400, "You cannot follow yourself")
     if not await db.users.find_one({"id": reporter_id, "role": "reporter"}):
         raise HTTPException(404, "Reporter not found")
-    await db.follows.update_one(
+    result = await db.follows.update_one(
         {"reporter_id": reporter_id, "supporter_id": user["id"]},
         {"$setOnInsert": {"reporter_id": reporter_id, "supporter_id": user["id"], "created_at": now()}},
         upsert=True,
     )
+    if result.upserted_id is not None:
+        await notify(
+            reporter_id,
+            "follow",
+            user,
+            f"{user['name']} started following you.",
+            subject_id=user["id"],
+            subject_kind="reader",
+        )
     return {"ok": True, "following": True, "followers": await _follower_count(reporter_id)}
 
 
@@ -734,6 +774,17 @@ async def verify_support(payload: dict, user: dict = Depends(require_roles("clie
         query,
         {"$set": {"payment_id": payment_id, "status": "verified", "verified_at": now()}},
     )
+    updated = await db.supports.find_one(query, {"_id": 0})
+    if updated:
+        await notify(
+            updated["reporter_id"],
+            "support",
+            user,
+            f"{user['name']} sent you ₹{updated['amount']}"
+            + (" (monthly pledge)." if updated.get("interval") == "monthly" else "."),
+            subject_id=updated["id"],
+            subject_kind="support",
+        )
     return {"ok": True, "status": "verified"}
 
 
