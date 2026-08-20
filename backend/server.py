@@ -15,15 +15,14 @@ from dotenv import load_dotenv
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from livekit import api as livekit_api
-from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, Field
 from pwdlib import PasswordHash
 from starlette.middleware.cors import CORSMiddleware
 
+import database as db
+
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
-client = AsyncIOMotorClient(os.environ["MONGO_URL"])
-db = client[os.environ["DB_NAME"]]
 app = FastAPI(title="FreePress API")
 api_router = APIRouter(prefix="/api")
 bearer = HTTPBearer(auto_error=False)
@@ -119,6 +118,13 @@ class CommentCreate(BaseModel):
     parent_id: Optional[str] = None
 
 
+def _strip_keys(row: dict | None, keys: list[str]) -> dict | None:
+    """Remove unwanted keys from a dict (replaces Mongo projection {\"_id\": 0, \"password_hash\": 0})."""
+    if row is None:
+        return None
+    return {k: v for k, v in row.items() if k not in keys}
+
+
 def public_user(user: dict) -> dict:
     return {"id": user["id"], "name": user["name"], "email": user["email"], "role": user["role"], "verified": user.get("verified", False)}
 
@@ -135,7 +141,7 @@ async def notify(
     recipient (people don't need to be pinged about their own actions)."""
     if recipient_id == actor.get("id"):
         return
-    await db.notifications.insert_one({
+    await db.insert_one("notifications", {
         "id": str(uuid.uuid4()),
         "recipient_id": recipient_id,
         "kind": kind,
@@ -159,9 +165,10 @@ async def current_user(credentials: HTTPAuthorizationCredentials = Depends(beare
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Authentication required")
     try:
         claims = jwt.decode(credentials.credentials, jwt_secret(), algorithms=["HS256"])
-        user = await db.users.find_one({"id": claims["sub"], "disabled": {"$ne": True}}, {"_id": 0, "password_hash": 0})
+        user = await db.find_one("users", {"id": claims["sub"], "disabled": False})
         if not user or user["role"] != claims.get("role"):
             raise ValueError("user changed")
+        user = _strip_keys(user, ["password_hash"])
         return user
     except HTTPException:
         raise
@@ -180,8 +187,8 @@ def require_roles(*roles: str):
 
 async def seed_data():
     # Admin seed
-    if not await db.users.find_one({"email": "admin@freepress.in"}):
-        await db.users.insert_one({
+    if not await db.find_one("users", {"email": "admin@freepress.in"}):
+        await db.insert_one("users", {
             "id": str(uuid.uuid4()),
             "name": "Platform Admin",
             "email": "admin@freepress.in",
@@ -192,10 +199,10 @@ async def seed_data():
             "disabled": False,
         })
     # Demo reporter seed (for the feed to have a real author)
-    reporter = await db.users.find_one({"email": "rhea@freepress.in"})
+    reporter = await db.find_one("users", {"email": "rhea@freepress.in"})
     if not reporter:
         reporter_id = str(uuid.uuid4())
-        await db.users.insert_one({
+        await db.insert_one("users", {
             "id": reporter_id,
             "name": "Rhea Iyer",
             "email": "rhea@freepress.in",
@@ -211,8 +218,8 @@ async def seed_data():
     else:
         reporter_id = reporter["id"]
     # Demo client seed
-    if not await db.users.find_one({"email": "reader@freepress.in"}):
-        await db.users.insert_one({
+    if not await db.find_one("users", {"email": "reader@freepress.in"}):
+        await db.insert_one("users", {
             "id": str(uuid.uuid4()),
             "name": "Curious Reader",
             "email": "reader@freepress.in",
@@ -223,8 +230,9 @@ async def seed_data():
             "disabled": False,
         })
     # Seed a few posts if none exist
-    if await db.posts.count_documents({}) == 0:
-        await db.posts.insert_many([
+    post_count = await db.count("posts")
+    if post_count == 0:
+        await db.insert_many("posts", [
             {"id": str(uuid.uuid4()), "reporter_id": reporter_id, "reporter_name": "Rhea Iyer", "verified": True, "title": "The river is rising. The village is still waiting.", "body": "A field dispatch from the eastern floodplain, where residents are building their own warning network.", "kind": "field report", "location": "Kosi floodplain", "stats": "1.8k reads", "created_at": now()},
             {"id": str(uuid.uuid4()), "reporter_id": reporter_id, "reporter_name": "Rhea Iyer", "verified": True, "title": "Inside the last independent print room", "body": "A visual report on the people keeping local records alive, one page at a time.", "kind": "photo essay", "location": "Old Delhi", "stats": "842 reads", "created_at": now()},
         ])
@@ -232,6 +240,7 @@ async def seed_data():
 
 @app.on_event("startup")
 async def startup():
+    await db.init_db()
     await seed_data()
 
 
@@ -244,7 +253,7 @@ async def health():
 async def register(payload: Register):
     role = payload.role if payload.role in {"client", "reporter"} else "client"
     email = payload.email.strip().lower()
-    if await db.users.find_one({"email": email}):
+    if await db.find_one("users", {"email": email}):
         raise HTTPException(409, "An account with this email already exists")
     user = {
         "id": str(uuid.uuid4()),
@@ -256,13 +265,13 @@ async def register(payload: Register):
         "created_at": now(),
         "disabled": False,
     }
-    await db.users.insert_one(user)
+    await db.insert_one("users", user)
     return {"access_token": token_for(user), "token_type": "bearer", "user": public_user(user)}
 
 
 @api_router.post("/auth/login")
 async def login(payload: Login):
-    user = await db.users.find_one({"email": payload.email.strip().lower()}, {"_id": 0})
+    user = await db.find_one("users", {"email": payload.email.strip().lower()})
     if not user or not password_hash.verify(payload.password, user["password_hash"]):
         raise HTTPException(401, "Invalid email or password")
     if user.get("disabled"):
@@ -277,16 +286,22 @@ async def me(user: dict = Depends(current_user)):
 
 @api_router.get("/feed")
 async def feed():
-    return await db.posts.find({}, {"_id": 0}).sort("created_at", -1).to_list(50)
+    return await db.find_many("posts", order_by="created_at", desc=True, limit=50)
 
 
 @api_router.get("/feed/following")
 async def feed_following(user: dict = Depends(current_user)):
-    follows = await db.follows.find({"supporter_id": user["id"]}, {"_id": 0, "reporter_id": 1}).to_list(500)
+    follows = await db.find_many("follows", {"supporter_id": user["id"]})
     ids = [row["reporter_id"] for row in follows]
     if not ids:
         return []
-    return await db.posts.find({"reporter_id": {"$in": ids}}, {"_id": 0}).sort("created_at", -1).to_list(100)
+    return await db.find_many(
+        "posts",
+        {"reporter_id": {"$in": ids}},
+        order_by="created_at",
+        desc=True,
+        limit=100,
+    )
 
 
 @api_router.get("/feed/trending")
@@ -297,26 +312,27 @@ async def feed_trending():
     interest."""
     cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
 
+    # Read counts via RPC
     read_counts: dict[str, int] = {}
-    async for row in db.reads.aggregate([
-        {"$match": {"created_at": {"$gte": cutoff}}},
-        {"$group": {"_id": "$post_id", "count": {"$sum": 1}}},
-    ]):
-        read_counts[row["_id"]] = row["count"]
+    read_rows = await db.rpc("read_counts_since", {"cutoff": cutoff})
+    for row in read_rows:
+        read_counts[row["post_id"]] = row["count"]
 
+    # Support counts via RPC
     support_counts: dict[str, int] = {}
-    async for row in db.supports.aggregate([
-        {"$match": {"status": "verified", "verified_at": {"$gte": cutoff}}},
-        {"$group": {"_id": "$reporter_id", "count": {"$sum": 1}}},
-    ]):
-        support_counts[row["_id"]] = row["count"]
+    support_rows = await db.rpc("support_counts_since", {"cutoff": cutoff})
+    for row in support_rows:
+        support_counts[row["reporter_id"]] = row["count"]
 
-    posts = await db.posts.find({"created_at": {"$gte": cutoff}}, {"_id": 0}).to_list(200)
+    posts = await db.find_many("posts", {"created_at": {"$gte": cutoff}}, limit=200)
     # Include any older post that got engagement in the window too.
     if read_counts:
-        older = await db.posts.find(
-            {"id": {"$in": list(read_counts.keys())}, "created_at": {"$lt": cutoff}}, {"_id": 0},
-        ).to_list(200)
+        engaged_ids = list(read_counts.keys())
+        older = await db.find_many(
+            "posts",
+            {"id": {"$in": engaged_ids}, "created_at": {"$lt": cutoff}},
+            limit=200,
+        )
         seen = {p["id"] for p in posts}
         for p in older:
             if p["id"] not in seen:
@@ -333,43 +349,47 @@ async def feed_trending():
 async def mark_read(post_id: str, user: dict = Depends(current_user)):
     """Record a read for trending. De-duped per (viewer, post, day) so refresh
     spam doesn't skew the ranking."""
-    if not await db.posts.find_one({"id": post_id}, {"_id": 0, "id": 1}):
+    if not await db.find_one("posts", {"id": post_id}):
         raise HTTPException(404, "Post not found")
     day = datetime.now(timezone.utc).date().isoformat()
     key = f"{post_id}:{user['id']}:{day}"
-    result = await db.reads.update_one(
-        {"key": key},
-        {"$setOnInsert": {"key": key, "post_id": post_id, "viewer_id": user["id"], "created_at": now()}},
-        upsert=True,
-    )
-    return {"ok": True, "new": result.upserted_id is not None}
+    existing = await db.find_one("reads", {"key": key})
+    if existing:
+        return {"ok": True, "new": False}
+    await db.insert_one("reads", {
+        "key": key,
+        "post_id": post_id,
+        "viewer_id": user["id"],
+        "created_at": now(),
+    })
+    return {"ok": True, "new": True}
 
 
 @api_router.post("/bookmarks")
 async def create_bookmark(payload: BookmarkCreate, user: dict = Depends(current_user)):
-    if not await db.posts.find_one({"id": payload.post_id}, {"_id": 0, "id": 1}):
+    if not await db.find_one("posts", {"id": payload.post_id}):
         raise HTTPException(404, "Post not found")
-    await db.bookmarks.update_one(
-        {"user_id": user["id"], "post_id": payload.post_id},
-        {"$setOnInsert": {"user_id": user["id"], "post_id": payload.post_id, "created_at": now()}},
-        upsert=True,
-    )
+    await db.upsert_one("bookmarks", {
+        "user_id": user["id"],
+        "post_id": payload.post_id,
+        "created_at": now(),
+    }, on_conflict="user_id,post_id")
     return {"ok": True, "bookmarked": True}
 
 
 @api_router.delete("/bookmarks/{post_id}")
 async def delete_bookmark(post_id: str, user: dict = Depends(current_user)):
-    await db.bookmarks.delete_one({"user_id": user["id"], "post_id": post_id})
+    await db.delete_one("bookmarks", {"user_id": user["id"], "post_id": post_id})
     return {"ok": True, "bookmarked": False}
 
 
 @api_router.get("/bookmarks")
 async def list_bookmarks(user: dict = Depends(current_user)):
-    rows = await db.bookmarks.find({"user_id": user["id"]}, {"_id": 0}).sort("created_at", -1).to_list(200)
+    rows = await db.find_many("bookmarks", {"user_id": user["id"]}, order_by="created_at", desc=True, limit=200)
     if not rows:
         return {"post_ids": [], "posts": []}
     post_ids = [r["post_id"] for r in rows]
-    posts = await db.posts.find({"id": {"$in": post_ids}}, {"_id": 0}).to_list(200)
+    posts = await db.find_many("posts", {"id": {"$in": post_ids}}, limit=200)
     order = {pid: idx for idx, pid in enumerate(post_ids)}
     posts.sort(key=lambda p: order.get(p["id"], 9999))
     return {"post_ids": post_ids, "posts": posts}
@@ -378,38 +398,35 @@ async def list_bookmarks(user: dict = Depends(current_user)):
 async def _support_totals(reporter_ids: list[str]) -> dict[str, int]:
     if not reporter_ids:
         return {}
-    pipeline = [
-        {"$match": {"reporter_id": {"$in": reporter_ids}, "status": "verified"}},
-        {"$group": {"_id": "$reporter_id", "total": {"$sum": "$amount"}, "count": {"$sum": 1}}},
-    ]
-    out: dict[str, int] = {}
-    async for row in db.supports.aggregate(pipeline):
-        out[row["_id"]] = row["total"]
-    return out
+    rows = await db.rpc("support_totals", {"reporter_ids": reporter_ids})
+    return {row["reporter_id"]: row["total"] for row in rows}
 
 
 async def _follower_count(reporter_id: str) -> int:
-    return await db.follows.count_documents({"reporter_id": reporter_id})
+    return await db.count("follows", {"reporter_id": reporter_id})
 
 
 @api_router.get("/reporters")
 async def list_reporters():
-    users = await db.users.find({"role": "reporter", "disabled": {"$ne": True}}, {"_id": 0, "password_hash": 0}).to_list(50)
+    users = await db.find_many(
+        "users",
+        {"role": "reporter", "disabled": False},
+        limit=50,
+    )
+    users = [_strip_keys(u, ["password_hash"]) for u in users]
     ids = [u["id"] for u in users]
     totals = await _support_totals(ids)
-    follower_counts: dict[str, int] = {}
-    async for row in db.follows.aggregate([
-        {"$match": {"reporter_id": {"$in": ids}}},
-        {"$group": {"_id": "$reporter_id", "count": {"$sum": 1}}},
-    ]):
-        follower_counts[row["_id"]] = row["count"]
+    follower_counts_map: dict[str, int] = {}
+    fc_rows = await db.rpc("follower_counts", {"reporter_ids": ids})
+    for row in fc_rows:
+        follower_counts_map[row["reporter_id"]] = row["count"]
     return [
         {
             "id": u["id"],
             "name": u["name"],
             "beat": u.get("beat", "Independent reporting"),
             "location": u.get("location", "India"),
-            "followers": follower_counts.get(u["id"], 0),
+            "followers": follower_counts_map.get(u["id"], 0),
             "support_total": totals.get(u["id"], 0),
             "verified": u.get("verified", False),
         }
@@ -419,10 +436,11 @@ async def list_reporters():
 
 @api_router.get("/reporters/{reporter_id}")
 async def get_reporter(reporter_id: str, credentials: HTTPAuthorizationCredentials = Depends(bearer)):
-    user = await db.users.find_one({"id": reporter_id, "role": "reporter"}, {"_id": 0, "password_hash": 0})
+    user = await db.find_one("users", {"id": reporter_id, "role": "reporter"})
     if not user:
         raise HTTPException(404, "Reporter not found")
-    posts = await db.posts.find({"reporter_id": reporter_id}, {"_id": 0}).sort("created_at", -1).to_list(50)
+    user = _strip_keys(user, ["password_hash"])
+    posts = await db.find_many("posts", {"reporter_id": reporter_id}, order_by="created_at", desc=True, limit=50)
     totals = await _support_totals([reporter_id])
     followers = await _follower_count(reporter_id)
     is_following = False
@@ -431,7 +449,8 @@ async def get_reporter(reporter_id: str, credentials: HTTPAuthorizationCredentia
         try:
             claims = jwt.decode(credentials.credentials, jwt_secret(), algorithms=["HS256"])
             viewer = claims.get("sub")
-            is_following = bool(await db.follows.find_one({"reporter_id": reporter_id, "supporter_id": viewer}))
+            follow_row = await db.find_one("follows", {"reporter_id": reporter_id, "supporter_id": viewer})
+            is_following = follow_row is not None
         except Exception:
             viewer = None
     return {
@@ -450,14 +469,17 @@ async def get_reporter(reporter_id: str, credentials: HTTPAuthorizationCredentia
 async def follow_reporter(reporter_id: str, user: dict = Depends(current_user)):
     if user["id"] == reporter_id:
         raise HTTPException(400, "You cannot follow yourself")
-    if not await db.users.find_one({"id": reporter_id, "role": "reporter"}):
+    if not await db.find_one("users", {"id": reporter_id, "role": "reporter"}):
         raise HTTPException(404, "Reporter not found")
-    result = await db.follows.update_one(
-        {"reporter_id": reporter_id, "supporter_id": user["id"]},
-        {"$setOnInsert": {"reporter_id": reporter_id, "supporter_id": user["id"], "created_at": now()}},
-        upsert=True,
-    )
-    if result.upserted_id is not None:
+    # Check if already following
+    existing = await db.find_one("follows", {"reporter_id": reporter_id, "supporter_id": user["id"]})
+    is_new = existing is None
+    if is_new:
+        await db.insert_one("follows", {
+            "reporter_id": reporter_id,
+            "supporter_id": user["id"],
+            "created_at": now(),
+        })
         await notify(
             reporter_id,
             "follow",
@@ -471,29 +493,35 @@ async def follow_reporter(reporter_id: str, user: dict = Depends(current_user)):
 
 @api_router.delete("/reporters/{reporter_id}/follow")
 async def unfollow_reporter(reporter_id: str, user: dict = Depends(current_user)):
-    await db.follows.delete_one({"reporter_id": reporter_id, "supporter_id": user["id"]})
+    await db.delete_one("follows", {"reporter_id": reporter_id, "supporter_id": user["id"]})
     return {"ok": True, "following": False, "followers": await _follower_count(reporter_id)}
 
 
 @api_router.post("/posts")
 async def create_post(payload: PostCreate, user: dict = Depends(require_roles("reporter", "admin"))):
+    media_data = [m.model_dump() for m in payload.media] if payload.media else []
     post = {
         "id": str(uuid.uuid4()),
         "reporter_id": user["id"],
         "reporter_name": user["name"],
-        **payload.model_dump(),
+        "title": payload.title,
+        "body": payload.body,
+        "kind": payload.kind,
+        "location": payload.location,
+        "media": json.dumps(media_data),
         "verified": user.get("verified", False),
         "stats": "New dispatch",
         "created_at": now(),
     }
-    await db.posts.insert_one(post)
-    post.pop("_id", None)
-    return post
+    result = await db.insert_one("posts", post)
+    # Return media as parsed JSON, not a string
+    result["media"] = media_data
+    return result
 
 
 @api_router.get("/posts/mine")
 async def my_posts(user: dict = Depends(require_roles("reporter", "admin"))):
-    return await db.posts.find({"reporter_id": user["id"]}, {"_id": 0}).sort("created_at", -1).to_list(100)
+    return await db.find_many("posts", {"reporter_id": user["id"]}, order_by="created_at", desc=True, limit=100)
 
 
 @api_router.get("/reporter/earnings")
@@ -501,40 +529,33 @@ async def reporter_earnings(user: dict = Depends(require_roles("reporter", "admi
     """Lifetime earnings breakdown for the signed-in reporter."""
     reporter_id = user["id"]
     # Lifetime verified totals
+    totals_rows = await db.rpc("support_totals", {"reporter_ids": [reporter_id]})
     lifetime = 0
     verified_count = 0
-    async for row in db.supports.aggregate([
-        {"$match": {"reporter_id": reporter_id, "status": "verified"}},
-        {"$group": {"_id": None, "total": {"$sum": "$amount"}, "count": {"$sum": 1}}},
-    ]):
-        lifetime = row["total"]
-        verified_count = row["count"]
+    for row in totals_rows:
+        if row["reporter_id"] == reporter_id:
+            lifetime = row["total"]
+            verified_count = row["count"]
     # Pending / created (not yet captured)
-    pending_amount = 0
-    pending_count = 0
-    async for row in db.supports.aggregate([
-        {"$match": {"reporter_id": reporter_id, "status": {"$in": ["created", "pending"]}}},
-        {"$group": {"_id": None, "total": {"$sum": "$amount"}, "count": {"$sum": 1}}},
-    ]):
-        pending_amount = row["total"]
-        pending_count = row["count"]
+    pending_supports = await db.find_many(
+        "supports",
+        {"reporter_id": reporter_id, "status": {"$in": ["created", "pending"]}},
+    )
+    pending_amount = sum(s.get("amount", 0) for s in pending_supports)
+    pending_count = len(pending_supports)
     # Active monthly pledges
-    monthly_pledges = await db.supports.count_documents({
+    monthly_pledges = await db.count("supports", {
         "reporter_id": reporter_id,
         "interval": "monthly",
         "status": {"$in": ["verified", "pending"]},
     })
     # Top supporters
+    top_rows = await db.rpc("top_supporters", {"target_reporter_id": reporter_id, "max_results": 5})
     top_supporters: list[dict] = []
-    async for row in db.supports.aggregate([
-        {"$match": {"reporter_id": reporter_id, "status": "verified"}},
-        {"$group": {"_id": "$supporter_id", "total": {"$sum": "$amount"}, "count": {"$sum": 1}}},
-        {"$sort": {"total": -1}},
-        {"$limit": 5},
-    ]):
-        supporter = await db.users.find_one({"id": row["_id"]}, {"_id": 0, "name": 1})
+    for row in top_rows:
+        supporter = await db.find_one("users", {"id": row["supporter_id"]})
         top_supporters.append({
-            "supporter_id": row["_id"],
+            "supporter_id": row["supporter_id"],
             "name": supporter["name"] if supporter else "Anonymous reader",
             "total": row["total"],
             "count": row["count"],
@@ -551,12 +572,12 @@ async def reporter_earnings(user: dict = Depends(require_roles("reporter", "admi
 
 @api_router.delete("/posts/{post_id}")
 async def delete_post(post_id: str, user: dict = Depends(current_user)):
-    post = await db.posts.find_one({"id": post_id}, {"_id": 0})
+    post = await db.find_one("posts", {"id": post_id})
     if not post:
         raise HTTPException(404, "Post not found")
     if user["role"] != "admin" and post["reporter_id"] != user["id"]:
         raise HTTPException(403, "You can only delete your own posts")
-    await db.posts.delete_one({"id": post_id})
+    await db.delete_one("posts", {"id": post_id})
     return {"ok": True}
 
 
@@ -573,7 +594,7 @@ async def create_upload(payload: UploadCreate, user: dict = Depends(require_role
     if response.status_code >= 400:
         raise HTTPException(502, "Mux could not create an upload URL")
     data = response.json()["data"]
-    await db.media.insert_one({
+    await db.insert_one("media", {
         "id": str(uuid.uuid4()),
         "owner_id": user["id"],
         "upload_id": data["id"],
@@ -591,7 +612,7 @@ async def media_status(upload_id: str, user: dict = Depends(current_user)):
     Used by the frontend after a direct upload finishes when the webhook is not
     wired in dev."""
     provider_required("MUX_TOKEN_ID", "MUX_TOKEN_SECRET")
-    record = await db.media.find_one({"upload_id": upload_id}, {"_id": 0})
+    record = await db.find_one("media", {"upload_id": upload_id})
     if not record:
         raise HTTPException(404, "Upload not found")
     if record.get("playback_id"):
@@ -603,16 +624,17 @@ async def media_status(upload_id: str, user: dict = Depends(current_user)):
             raise HTTPException(502, "Mux could not read the upload status")
         asset_id = (up_res.json().get("data") or {}).get("asset_id")
         if not asset_id:
-            return record | {"status": "waiting"}
+            return {**record, "status": "waiting"}
         asset_res = await http.get(f"https://api.mux.com/video/v1/assets/{asset_id}", auth=auth)
         if asset_res.status_code >= 400:
             raise HTTPException(502, "Mux could not read the asset")
         asset = asset_res.json().get("data", {})
     playback_ids = asset.get("playback_ids") or []
     playback_id = playback_ids[0]["id"] if playback_ids else None
-    await db.media.update_one(
+    await db.update_one(
+        "media",
         {"upload_id": upload_id},
-        {"$set": {"status": asset.get("status", "processing"), "asset_id": asset_id, "playback_id": playback_id}},
+        {"status": asset.get("status", "processing"), "asset_id": asset_id, "playback_id": playback_id},
     )
     return {**record, "status": asset.get("status", "processing"), "asset_id": asset_id, "playback_id": playback_id}
 
@@ -628,7 +650,12 @@ async def mux_webhook(request: Request):
     event = json.loads(raw)
     data = event.get("data", {})
     if event.get("type") == "video.asset.ready":
-        await db.media.update_one({"upload_id": data.get("upload_id") or data.get("id")}, {"$set": {"status": "ready", "asset_id": data.get("id"), "playback_id": (data.get("playback_ids") or [{}])[0].get("id")}})
+        playback_ids = data.get("playback_ids") or [{}]
+        await db.update_one(
+            "media",
+            {"upload_id": data.get("upload_id") or data.get("id")},
+            {"status": "ready", "asset_id": data.get("id"), "playback_id": playback_ids[0].get("id")},
+        )
     return {"ok": True}
 
 
@@ -642,13 +669,21 @@ async def live_token(payload: LiveCreate, user: dict = Depends(require_roles("re
         .with_name(user["name"])
         .with_grants(livekit_api.VideoGrants(room_join=True, room=room_name, can_publish=True, can_subscribe=True, can_publish_data=True))
     )
-    await db.live_sessions.insert_one({"id": str(uuid.uuid4()), "room": room_name, "reporter_id": user["id"], "reporter_name": user["name"], "title": payload.title, "status": "live", "started_at": now()})
+    await db.insert_one("live_sessions", {
+        "id": str(uuid.uuid4()),
+        "room": room_name,
+        "reporter_id": user["id"],
+        "reporter_name": user["name"],
+        "title": payload.title,
+        "status": "live",
+        "started_at": now(),
+    })
     return {"token": token.to_jwt(), "url": os.environ["LIVEKIT_URL"], "room": room_name}
 
 
 @api_router.get("/live/sessions")
 async def live_sessions():
-    return await db.live_sessions.find({"status": "live"}, {"_id": 0}).sort("started_at", -1).to_list(50)
+    return await db.find_many("live_sessions", {"status": "live"}, order_by="started_at", desc=True, limit=50)
 
 
 @api_router.post("/live/viewer-token")
@@ -668,12 +703,12 @@ async def live_viewer_token(payload: dict, user: dict = Depends(current_user)):
 
 @api_router.post("/live/{session_id}/end")
 async def end_live(session_id: str, user: dict = Depends(current_user)):
-    session = await db.live_sessions.find_one({"id": session_id}, {"_id": 0})
+    session = await db.find_one("live_sessions", {"id": session_id})
     if not session:
         raise HTTPException(404, "Session not found")
     if user["role"] != "admin" and session["reporter_id"] != user["id"]:
         raise HTTPException(403, "You cannot end this session")
-    await db.live_sessions.update_one({"id": session_id}, {"$set": {"status": "ended", "ended_at": now()}})
+    await db.update_one("live_sessions", {"id": session_id}, {"status": "ended", "ended_at": now()})
     return {"ok": True}
 
 
@@ -698,7 +733,7 @@ async def support_reporter(payload: SupportCreate, user: dict = Depends(require_
             "customer_notify": 1,
             "notes": {"supporter_id": user["id"], "reporter_id": payload.reporter_id},
         })
-        await db.supports.insert_one({
+        await db.insert_one("supports", {
             "id": str(uuid.uuid4()),
             "supporter_id": user["id"],
             "reporter_id": payload.reporter_id,
@@ -721,7 +756,7 @@ async def support_reporter(payload: SupportCreate, user: dict = Depends(require_
         "receipt": f"support-{uuid.uuid4().hex[:16]}",
         "notes": {"supporter_id": user["id"], "reporter_id": payload.reporter_id},
     })
-    await db.supports.insert_one({
+    await db.insert_one("supports", {
         "id": str(uuid.uuid4()),
         "supporter_id": user["id"],
         "reporter_id": payload.reporter_id,
@@ -770,11 +805,12 @@ async def verify_support(payload: dict, user: dict = Depends(require_roles("clie
         if subscription_id
         else {"order_id": order_id, "supporter_id": user["id"]}
     )
-    await db.supports.update_one(
+    await db.update_one(
+        "supports",
         query,
-        {"$set": {"payment_id": payment_id, "status": "verified", "verified_at": now()}},
+        {"payment_id": payment_id, "status": "verified", "verified_at": now()},
     )
-    updated = await db.supports.find_one(query, {"_id": 0})
+    updated = await db.find_one("supports", query)
     if updated:
         await notify(
             updated["reporter_id"],
@@ -791,21 +827,23 @@ async def verify_support(payload: dict, user: dict = Depends(require_roles("clie
 @api_router.get("/support/pledges")
 async def list_pledges(user: dict = Depends(current_user)):
     """Return the caller's monthly support pledges, one row per subscription."""
-    rows = await db.supports.find(
+    rows = await db.find_many(
+        "supports",
         {
             "supporter_id": user["id"],
             "interval": "monthly",
             "status": {"$in": ["pending", "verified", "active"]},
         },
-        {"_id": 0},
-    ).sort("created_at", -1).to_list(50)
+        order_by="created_at",
+        desc=True,
+        limit=50,
+    )
     reporter_ids = list({r["reporter_id"] for r in rows})
-    reporters = {}
+    reporters: dict[str, dict] = {}
     if reporter_ids:
-        async for u in db.users.find(
-            {"id": {"$in": reporter_ids}}, {"_id": 0, "id": 1, "name": 1, "verified": 1},
-        ):
-            reporters[u["id"]] = u
+        reporter_rows = await db.find_many("users", {"id": {"$in": reporter_ids}})
+        for u in reporter_rows:
+            reporters[u["id"]] = {"id": u["id"], "name": u["name"], "verified": u.get("verified", False)}
     return [
         {
             "id": r["id"],
@@ -821,7 +859,7 @@ async def list_pledges(user: dict = Depends(current_user)):
 
 @api_router.post("/support/pledges/{pledge_id}/cancel")
 async def cancel_pledge(pledge_id: str, user: dict = Depends(current_user)):
-    pledge = await db.supports.find_one({"id": pledge_id, "supporter_id": user["id"]}, {"_id": 0})
+    pledge = await db.find_one("supports", {"id": pledge_id, "supporter_id": user["id"]})
     if not pledge:
         raise HTTPException(404, "Pledge not found")
     if pledge.get("interval") != "monthly":
@@ -837,9 +875,10 @@ async def cancel_pledge(pledge_id: str, user: dict = Depends(current_user)):
             gateway.subscription.cancel(subscription_id, {"cancel_at_cycle_end": 0})
         except Exception:
             raise HTTPException(502, "Razorpay could not cancel this subscription")
-    await db.supports.update_one(
+    await db.update_one(
+        "supports",
         {"id": pledge_id},
-        {"$set": {"status": "cancelled", "cancelled_at": now()}},
+        {"status": "cancelled", "cancelled_at": now()},
     )
     return {"ok": True, "status": "cancelled"}
 
@@ -854,77 +893,87 @@ async def razorpay_webhook(request: Request):
         raise HTTPException(401, "Invalid Razorpay signature")
     event = json.loads(raw)
     event_id = request.headers.get("x-razorpay-event-id") or hashlib.sha256(raw).hexdigest()
-    if await db.webhook_events.find_one({"id": event_id}):
+    if await db.find_one("webhook_events", {"id": event_id}):
         return {"ok": True, "duplicate": True}
-    await db.webhook_events.insert_one({"id": event_id, "event": event.get("event"), "created_at": now()})
+    await db.insert_one("webhook_events", {"id": event_id, "event": event.get("event"), "created_at": now()})
     payment = event.get("payload", {}).get("payment", {}).get("entity", {})
     if event.get("event") in {"payment.captured", "order.paid"} and payment.get("order_id"):
-        await db.supports.update_one(
+        await db.update_one(
+            "supports",
             {"order_id": payment["order_id"]},
-            {"$set": {"status": "verified", "payment_id": payment.get("id"), "verified_at": now()}},
+            {"status": "verified", "payment_id": payment.get("id"), "verified_at": now()},
         )
     return {"ok": True}
 
 
 @api_router.post("/reports")
 async def report_post(payload: ReportCreate, user: dict = Depends(current_user)):
-    item = {"id": str(uuid.uuid4()), "reporter_id": user["id"], "reporter_name": user["name"], **payload.model_dump(), "status": "open", "created_at": now()}
-    await db.moderation.insert_one(item)
-    item.pop("_id", None)
+    item = {
+        "id": str(uuid.uuid4()),
+        "reporter_id": user["id"],
+        "reporter_name": user["name"],
+        "post_id": payload.post_id,
+        "reason": payload.reason,
+        "note": payload.note,
+        "status": "open",
+        "created_at": now(),
+    }
+    await db.insert_one("moderation", item)
     return item
 
 
 @api_router.get("/admin/overview")
 async def admin_overview(user: dict = Depends(require_roles("admin"))):
     return {
-        "users": await db.users.count_documents({"disabled": {"$ne": True}}),
-        "reporters": await db.users.count_documents({"role": "reporter", "disabled": {"$ne": True}}),
-        "posts": await db.posts.count_documents({}),
-        "open_reports": await db.moderation.count_documents({"status": "open"}),
-        "live_now": await db.live_sessions.count_documents({"status": "live"}),
-        "queue": await db.moderation.find({"status": "open"}, {"_id": 0}).sort("created_at", -1).to_list(20),
+        "users": await db.count("users", {"disabled": False}),
+        "reporters": await db.count("users", {"role": "reporter", "disabled": False}),
+        "posts": await db.count("posts"),
+        "open_reports": await db.count("moderation", {"status": "open"}),
+        "live_now": await db.count("live_sessions", {"status": "live"}),
+        "queue": await db.find_many("moderation", {"status": "open"}, order_by="created_at", desc=True, limit=20),
     }
 
 
 @api_router.get("/admin/users")
 async def admin_users(user: dict = Depends(require_roles("admin"))):
-    users = await db.users.find({}, {"_id": 0, "password_hash": 0}).sort("created_at", -1).to_list(200)
-    return users
+    users = await db.find_many("users", order_by="created_at", desc=True, limit=200)
+    return [_strip_keys(u, ["password_hash"]) for u in users]
 
 
 @api_router.post("/admin/users/{user_id}/disable")
 async def disable_user(user_id: str, user: dict = Depends(require_roles("admin"))):
     if user_id == user["id"]:
         raise HTTPException(400, "You cannot disable your own account")
-    result = await db.users.update_one({"id": user_id}, {"$set": {"disabled": True, "disabled_at": now()}})
-    if result.matched_count == 0:
+    result = await db.update_one("users", {"id": user_id}, {"disabled": True, "disabled_at": now()})
+    if result is None:
         raise HTTPException(404, "User not found")
     return {"ok": True}
 
 
 @api_router.post("/admin/users/{user_id}/enable")
 async def enable_user(user_id: str, user: dict = Depends(require_roles("admin"))):
-    result = await db.users.update_one({"id": user_id}, {"$set": {"disabled": False}, "$unset": {"disabled_at": ""}})
-    if result.matched_count == 0:
+    result = await db.update_one("users", {"id": user_id}, {"disabled": False, "disabled_at": None})
+    if result is None:
         raise HTTPException(404, "User not found")
     return {"ok": True}
 
 
 @api_router.post("/admin/users/{user_id}/verify")
 async def verify_user(user_id: str, user: dict = Depends(require_roles("admin"))):
-    result = await db.users.update_one({"id": user_id}, {"$set": {"verified": True}})
-    if result.matched_count == 0:
+    result = await db.update_one("users", {"id": user_id}, {"verified": True})
+    if result is None:
         raise HTTPException(404, "User not found")
     return {"ok": True}
 
 
 @api_router.post("/reports/{report_id}/resolve")
 async def resolve_report(report_id: str, user: dict = Depends(require_roles("admin"))):
-    result = await db.moderation.update_one(
+    result = await db.update_one(
+        "moderation",
         {"id": report_id, "status": "open"},
-        {"$set": {"status": "resolved", "resolved_by": user["id"], "resolved_at": now()}},
+        {"status": "resolved", "resolved_by": user["id"], "resolved_at": now()},
     )
-    if result.matched_count == 0:
+    if result is None:
         raise HTTPException(404, "Open report not found")
     return {"id": report_id, "status": "resolved"}
 
@@ -936,4 +985,4 @@ logging.basicConfig(level=logging.INFO)
 
 @app.on_event("shutdown")
 async def shutdown_db_client():
-    client.close()
+    await db.close_db()
